@@ -1,0 +1,42 @@
+{
+  "compilerOptions": {
+    "module": "commonjs",
+    "declaration": true,
+    "removeComments": true,
+    "emitDecoratorMetadata": true,
+    "experimentalDecorators": true,
+    "allowSyntheticDefaultImports": true,
+    "target": "ES2021",
+    "sourceMap": true,
+    "outDir": "./dist",
+    "baseUrl": "./",
+    "incremental": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "strictNullChecks": true,
+    "strictPropertyInitialization": false,
+    "noImplicitAny": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "esModuleInterop": true,
+    "paths": {
+      "@shared/*": ["src/shared/*"],
+      "@auth/*": ["src/modules/auth/*"],
+      "@clinic/*": ["src/modules/clinic/*"],
+      "@brand/*": ["src/modules/brand/*"],
+      "@agent-config/*": ["src/modules/agent-config/*"],
+      "@business-memory/*": ["src/modules/business-memory/*"],
+      "@agent-memory/*": ["src/modules/agent-memory/*"],
+      "@knowledge-hub/*": ["src/modules/knowledge-hub/*"],
+      "@model-registry/*": ["src/modules/model-registry/*"],
+      "@prompt-registry/*": ["src/modules/prompt-registry/*"],
+      "@guardrails/*": ["src/modules/guardrails/*"],
+      "@privacy/*": ["src/modules/privacy/*"],
+      "@observability/*": ["src/modules/observability/*"]
+    }
+  },
+  "include": ["src"],
+  "exclude": ["node_modules", "dist", "test"]
+}

@@ -1,0 +1,12 @@
+# Conta Corporativa (Default)
+Host github.com
+  HostName github.com
+  User git
+  IdentityFile ~/.ssh/id_ed25519  # Sua chave atual da firma
+
+# Conta Pessoal
+Host github-pessoal
+  HostName github.com
+  User git
+  IdentityFile ~/.ssh/id_ed25519_pessoal
+
