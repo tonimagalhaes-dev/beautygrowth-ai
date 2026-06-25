@@ -1,0 +1,24 @@
+{
+  "moduleFileExtensions": ["js", "json", "ts"],
+  "rootDir": ".",
+  "testEnvironment": "node",
+  "testRegex": ".e2e-spec.ts$",
+  "transform": {
+    "^.+\\.(t|j)s$": "ts-jest"
+  },
+  "moduleNameMapper": {
+    "^@shared/(.*)$": "<rootDir>/../src/shared/$1",
+    "^@auth/(.*)$": "<rootDir>/../src/modules/auth/$1",
+    "^@clinic/(.*)$": "<rootDir>/../src/modules/clinic/$1",
+    "^@brand/(.*)$": "<rootDir>/../src/modules/brand/$1",
+    "^@agent-config/(.*)$": "<rootDir>/../src/modules/agent-config/$1",
+    "^@business-memory/(.*)$": "<rootDir>/../src/modules/business-memory/$1",
+    "^@agent-memory/(.*)$": "<rootDir>/../src/modules/agent-memory/$1",
+    "^@knowledge-hub/(.*)$": "<rootDir>/../src/modules/knowledge-hub/$1",
+    "^@model-registry/(.*)$": "<rootDir>/../src/modules/model-registry/$1",
+    "^@prompt-registry/(.*)$": "<rootDir>/../src/modules/prompt-registry/$1",
+    "^@guardrails/(.*)$": "<rootDir>/../src/modules/guardrails/$1",
+    "^@privacy/(.*)$": "<rootDir>/../src/modules/privacy/$1",
+    "^@observability/(.*)$": "<rootDir>/../src/modules/observability/$1"
+  }
+}
