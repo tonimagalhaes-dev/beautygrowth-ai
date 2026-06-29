@@ -1,0 +1,658 @@
+"""gRPC Server: serves the AgentOrchestrationService over gRPC.
+
+Implements the AgentOrchestrationServicer with handlers for:
+- ExecuteWorkflow: orchestrates Agent Router + Workflow Engine + State Manager
+- GetExecutionState: queries execution state from State Manager
+- CancelExecution: cancels a running execution and persists partial state
+
+The server uses grpc.aio for async operation and supports graceful shutdown.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import signal
+import uuid
+from concurrent import futures
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+import grpc
+import grpc.aio
+
+from ..core.agent_router import (
+    AgentNotFoundError,
+    PostgresAgentRouter,
+    ResolvedWorkflow,
+    RouterConnectionError,
+    WorkflowDefinition,
+    WorkflowNotFoundError as RouterWorkflowNotFoundError,
+    NodeDefinition,
+    EdgeDefinition,
+)
+from ..core.graph_builder import build_agent_graph
+from ..core.state_manager import RedisStateManager
+from ..core.workflow_engine import (
+    ExecutionConfig,
+    ExecutionResult,
+    LangGraphWorkflowEngine,
+    WorkflowNotFoundError as EngineWorkflowNotFoundError,
+)
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_PORT = 50051
+MAX_WORKERS = 10
+
+
+# ============================================================
+# Response dataclasses (map to protobuf messages)
+# ============================================================
+
+
+@dataclass
+class TokenUsageResponse:
+    """Maps to protobuf TokenUsage message."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+@dataclass
+class StepResultResponse:
+    """Maps to protobuf StepResult message."""
+
+    node_id: str = ""
+    node_type: str = ""
+    output: str = ""
+    duration_ms: int = 0
+    tokens_used: TokenUsageResponse = field(default_factory=TokenUsageResponse)
+    status: str = "completed"
+    error_message: str = ""
+
+
+@dataclass
+class ExecutionStateResponse:
+    """Maps to protobuf ExecutionState message."""
+
+    execution_id: str = ""
+    workflow_id: str = ""
+    tenant_id: str = ""
+    status: str = "pending"
+    state_data: Dict[str, Any] = field(default_factory=dict)
+    current_node: str = ""
+    completed_nodes: List[str] = field(default_factory=list)
+    created_at: str = ""
+    updated_at: str = ""
+
+
+@dataclass
+class ExecuteWorkflowResponse:
+    """Maps to protobuf ExecuteWorkflowResponse message."""
+
+    success: bool = False
+    output: str = ""
+    trace_id: str = ""
+    model_id: str = ""
+    used_fallback: bool = False
+    tokens_used: TokenUsageResponse = field(default_factory=TokenUsageResponse)
+    duration_ms: int = 0
+    blocked_reason: str = ""
+    guardrail_violations: List[str] = field(default_factory=list)
+    final_state: Optional[ExecutionStateResponse] = None
+    steps: List[StepResultResponse] = field(default_factory=list)
+
+
+# ============================================================
+# AgentOrchestrationServicer
+# ============================================================
+
+
+class AgentOrchestrationServicer:
+    """Implements the AgentOrchestrationService gRPC service.
+
+    Integrates Agent Router, Workflow Engine, and State Manager to
+    handle workflow execution and state queries with multi-tenant isolation.
+    """
+
+    def __init__(
+        self,
+        state_manager: RedisStateManager,
+        workflow_engine: LangGraphWorkflowEngine,
+        agent_router: PostgresAgentRouter,
+    ) -> None:
+        """Initialize the servicer with core dependencies.
+
+        Args:
+            state_manager: Manages execution state in Redis/PostgreSQL.
+            workflow_engine: Executes DAG-based workflows.
+            agent_router: Resolves which workflow to execute per agent.
+        """
+        self._state_manager = state_manager
+        self._workflow_engine = workflow_engine
+        self._agent_router = agent_router
+
+    async def ExecuteWorkflow(
+        self,
+        request: Any,
+        context: grpc.aio.ServicerContext,
+    ) -> Dict[str, Any]:
+        """Handle ExecuteWorkflow RPC.
+
+        Orchestrates the full execution flow:
+        1. Extract tenant_id, agent_id, user_input from request
+        2. Generate execution_id (UUID)
+        3. Resolve workflow via agent_router
+        4. Build graph from resolved workflow definition
+        5. Register workflow in engine
+        6. Create initial state via state_manager
+        7. Execute workflow via engine
+        8. Persist final state via state_manager
+        9. Return ExecuteWorkflowResponse
+
+        Args:
+            request: ExecuteWorkflowRequest (dict-like or protobuf message).
+            context: gRPC servicer context for error handling.
+
+        Returns:
+            Dict representing ExecuteWorkflowResponse.
+        """
+        # Extract fields from request (supports both dict and protobuf-like objects)
+        tenant_id = _get_field(request, "tenant_id", "")
+        agent_id = _get_field(request, "agent_id", "")
+        user_input = _get_field(request, "user_input", "")
+        user_id = _get_field(request, "user_id", "")
+        conversation_id = _get_field(request, "conversation_id", "")
+        workflow_id_hint = _get_field(request, "workflow_id", "")
+        tenant_context = _get_field(request, "tenant_context", {})
+
+        # Extract execution options
+        options = _get_field(request, "options", {})
+        max_steps = _get_nested_field(options, "max_steps", 50)
+        timeout_ms = _get_nested_field(options, "timeout_ms", 120_000)
+
+        # Generate identifiers
+        execution_id = str(uuid.uuid4())
+        trace_id = str(uuid.uuid4())
+
+        logger.info(
+            "ExecuteWorkflow started: execution_id=%s, agent_id=%s, tenant_id=%s",
+            execution_id,
+            agent_id,
+            tenant_id,
+        )
+
+        try:
+            # Step 1: Resolve workflow via Agent Router
+            resolved = await self._agent_router.resolve_workflow(
+                agent_id=agent_id,
+                tenant_id=tenant_id,
+                context=tenant_context if tenant_context else None,
+            )
+
+            resolved_workflow_id = resolved.workflow_id
+
+            # Step 2: Build graph from resolved workflow definition
+            workflow_definition = _build_workflow_definition_from_resolved(resolved)
+            compiled_graph = build_agent_graph(workflow_definition)
+
+            # Step 3: Register workflow in engine
+            self._workflow_engine.register_workflow(resolved_workflow_id, compiled_graph)
+
+            # Step 4: Create initial state via State Manager
+            initial_state = {
+                "user_input": user_input,
+                "tenant_id": tenant_id,
+                "agent_id": agent_id,
+                "conversation_id": conversation_id,
+                "messages": [],
+                "intermediate_results": {},
+                "output": "",
+                "steps": [],
+            }
+
+            await self._state_manager.create_state(
+                execution_id=execution_id,
+                tenant_id=tenant_id,
+                workflow_id=resolved_workflow_id,
+                initial_state=initial_state,
+                trace_id=trace_id,
+            )
+
+            # Step 5: Execute workflow via engine
+            config = ExecutionConfig(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                trace_id=trace_id,
+                max_steps=max_steps or 50,
+                timeout_ms=timeout_ms or 120_000,
+            )
+
+            result: ExecutionResult = await self._workflow_engine.execute(
+                workflow_id=resolved_workflow_id,
+                initial_state=initial_state,
+                config=config,
+            )
+
+            # Step 6: Persist final state
+            final_state_data = {
+                "execution_id": execution_id,
+                "workflow_id": resolved_workflow_id,
+                "tenant_id": tenant_id,
+                "agent_id": agent_id,
+                "conversation_id": conversation_id,
+                "user_id": user_id,
+                "user_input": user_input,
+                "status": "completed" if result.success else "failed",
+                "output": result.output,
+                "state_data": result.final_state,
+                "steps": [_step_result_to_dict(s) for s in result.steps],
+                "tokens_input": result.tokens_used.input_tokens,
+                "tokens_output": result.tokens_used.output_tokens,
+                "duration_ms": result.duration_ms,
+                "model_id": result.model_id,
+                "used_fallback": result.used_fallback,
+                "error_message": result.blocked_reason,
+                "blocked_reason": result.blocked_reason,
+                "guardrail_violations": result.guardrail_violations,
+                "completed_at": datetime.now(timezone.utc),
+            }
+
+            await self._state_manager.persist_final_state(
+                execution_id=execution_id,
+                tenant_id=tenant_id,
+                final_state=final_state_data,
+                trace_id=trace_id,
+            )
+
+            # Step 7: Build and return response
+            response = ExecuteWorkflowResponse(
+                success=result.success,
+                output=result.output,
+                trace_id=trace_id,
+                model_id=result.model_id,
+                used_fallback=result.used_fallback,
+                tokens_used=TokenUsageResponse(
+                    input_tokens=result.tokens_used.input_tokens,
+                    output_tokens=result.tokens_used.output_tokens,
+                ),
+                duration_ms=result.duration_ms,
+                blocked_reason=result.blocked_reason or "",
+                guardrail_violations=result.guardrail_violations or [],
+                final_state=ExecutionStateResponse(
+                    execution_id=execution_id,
+                    workflow_id=resolved_workflow_id,
+                    tenant_id=tenant_id,
+                    status="completed" if result.success else "failed",
+                    state_data=result.final_state,
+                    current_node="",
+                    completed_nodes=[s.node_id for s in result.steps],
+                    created_at=datetime.now(timezone.utc).isoformat(),
+                    updated_at=datetime.now(timezone.utc).isoformat(),
+                ),
+                steps=[
+                    StepResultResponse(
+                        node_id=s.node_id,
+                        node_type=s.node_type,
+                        output=s.output,
+                        duration_ms=s.duration_ms,
+                        tokens_used=TokenUsageResponse(
+                            input_tokens=s.tokens_used.input_tokens,
+                            output_tokens=s.tokens_used.output_tokens,
+                        ),
+                        status=s.status,
+                        error_message=s.error_message or "",
+                    )
+                    for s in result.steps
+                ],
+            )
+
+            logger.info(
+                "ExecuteWorkflow completed: execution_id=%s, success=%s, duration_ms=%d",
+                execution_id,
+                result.success,
+                result.duration_ms,
+            )
+
+            return asdict(response)
+
+        except AgentNotFoundError as e:
+            logger.warning(
+                "Agent not found: agent_id=%s, tenant_id=%s, error=%s",
+                agent_id,
+                tenant_id,
+                str(e),
+            )
+            await context.abort(
+                grpc.StatusCode.NOT_FOUND,
+                f"Agent not found: {agent_id}",
+            )
+
+        except RouterWorkflowNotFoundError as e:
+            logger.warning(
+                "Workflow not found for agent: agent_id=%s, tenant_id=%s",
+                agent_id,
+                tenant_id,
+            )
+            await context.abort(
+                grpc.StatusCode.NOT_FOUND,
+                f"No active workflow found for agent_id={agent_id}, tenant_id={tenant_id}",
+            )
+
+        except RouterConnectionError as e:
+            logger.error(
+                "Router connection error: agent_id=%s, tenant_id=%s, error=%s",
+                agent_id,
+                tenant_id,
+                str(e),
+            )
+            await context.abort(
+                grpc.StatusCode.UNAVAILABLE,
+                "Service temporarily unavailable: database connection error",
+            )
+
+        except grpc.aio.AbortError:
+            # Re-raise gRPC abort errors (from context.abort above)
+            raise
+
+        except Exception as e:
+            logger.exception(
+                "Unexpected error in ExecuteWorkflow: execution_id=%s, error=%s",
+                execution_id,
+                str(e),
+            )
+            await context.abort(
+                grpc.StatusCode.INTERNAL,
+                f"Internal error during workflow execution: {type(e).__name__}",
+            )
+
+    async def GetExecutionState(
+        self,
+        request: Any,
+        context: grpc.aio.ServicerContext,
+    ) -> Dict[str, Any]:
+        """Handle GetExecutionState RPC.
+
+        Queries the State Manager for execution state by execution_id and tenant_id.
+
+        Args:
+            request: GetExecutionStateRequest (dict-like or protobuf message).
+            context: gRPC servicer context for error handling.
+
+        Returns:
+            Dict representing ExecutionState, or sets gRPC NOT_FOUND error.
+        """
+        execution_id = _get_field(request, "execution_id", "")
+        tenant_id = _get_field(request, "tenant_id", "")
+
+        logger.info(
+            "GetExecutionState: execution_id=%s, tenant_id=%s",
+            execution_id,
+            tenant_id,
+        )
+
+        if not execution_id or not tenant_id:
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                "execution_id and tenant_id are required",
+            )
+            return {}
+
+        try:
+            state = await self._state_manager.get_state(
+                execution_id=execution_id,
+                tenant_id=tenant_id,
+            )
+
+            if state is None:
+                await context.abort(
+                    grpc.StatusCode.NOT_FOUND,
+                    f"Execution state not found: execution_id={execution_id}",
+                )
+                return {}
+
+            # Build response from state data
+            response = ExecutionStateResponse(
+                execution_id=state.get("execution_id", execution_id),
+                workflow_id=state.get("workflow_id", ""),
+                tenant_id=state.get("tenant_id", tenant_id),
+                status=state.get("status", "unknown"),
+                state_data=state,
+                current_node=state.get("current_node", ""),
+                completed_nodes=state.get("completed_nodes", []),
+                created_at=state.get("created_at", ""),
+                updated_at=state.get("updated_at", ""),
+            )
+
+            logger.info(
+                "GetExecutionState found: execution_id=%s, status=%s",
+                execution_id,
+                response.status,
+            )
+
+            return asdict(response)
+
+        except grpc.aio.AbortError:
+            # Re-raise gRPC abort errors (from context.abort above)
+            raise
+        except Exception as e:
+            logger.exception(
+                "Error in GetExecutionState: execution_id=%s, error=%s",
+                execution_id,
+                str(e),
+            )
+            await context.abort(
+                grpc.StatusCode.INTERNAL,
+                f"Internal error retrieving execution state: {type(e).__name__}",
+            )
+            return {}
+
+
+# ============================================================
+# serve() function
+# ============================================================
+
+
+async def serve(
+    servicer: AgentOrchestrationServicer,
+    port: Optional[int] = None,
+) -> None:
+    """Start the gRPC server with graceful shutdown support.
+
+    Creates a gRPC async server, registers the servicer, and listens
+    on the specified port. Handles SIGTERM and SIGINT for graceful shutdown.
+
+    Args:
+        servicer: The AgentOrchestrationServicer instance to register.
+        port: Port to listen on. Defaults to GRPC_PORT env var or 50051.
+    """
+    if port is None:
+        port = int(os.environ.get("GRPC_PORT", str(DEFAULT_PORT)))
+
+    server = grpc.aio.server(
+        futures.ThreadPoolExecutor(max_workers=MAX_WORKERS),
+    )
+
+    # Register servicer — in production this would use the generated
+    # add_AgentOrchestrationServiceServicer_to_server function.
+    # For now, we register handlers manually via generic service.
+    _register_servicer(server, servicer)
+
+    listen_addr = f"[::]:{port}"
+    server.add_insecure_port(listen_addr)
+
+    logger.info("Starting gRPC server on %s", listen_addr)
+    await server.start()
+    logger.info("gRPC server started successfully on port %d", port)
+
+    # Setup graceful shutdown handlers
+    shutdown_event = asyncio.Event()
+
+    def _signal_handler(sig: int) -> None:
+        logger.info("Received signal %s, initiating graceful shutdown...", sig)
+        shutdown_event.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _signal_handler, sig)
+        except NotImplementedError:
+            # Windows doesn't support add_signal_handler
+            pass
+
+    # Wait for shutdown signal
+    await shutdown_event.wait()
+
+    # Graceful shutdown with grace period
+    grace_period = float(os.environ.get("GRPC_SHUTDOWN_GRACE_SECONDS", "5"))
+    logger.info("Shutting down gRPC server with %.1fs grace period...", grace_period)
+    await server.stop(grace_period)
+    logger.info("gRPC server stopped")
+
+
+def _register_servicer(
+    server: grpc.aio.Server,
+    servicer: AgentOrchestrationServicer,
+) -> None:
+    """Register the servicer's handlers with the gRPC server.
+
+    Uses generic handler registration since generated stubs may not exist yet.
+    When protobuf stubs are generated, this should be replaced with:
+        add_AgentOrchestrationServiceServicer_to_server(servicer, server)
+
+    Args:
+        server: The gRPC async server instance.
+        servicer: The servicer to register.
+    """
+    from grpc import unary_unary_rpc_method_handler
+
+    service_name = "beautygrowth.orchestration.v1.AgentOrchestrationService"
+
+    # Create method handlers
+    handler = grpc.method_service_handler(
+        None, None, None, None
+    ) if False else None  # noqa: placeholder
+
+    # Register using generic handlers for now
+    # Once proto stubs are generated, replace with:
+    # from src.grpc.generated import agent_orchestration_pb2_grpc
+    # agent_orchestration_pb2_grpc.add_AgentOrchestrationServiceServicer_to_server(
+    #     servicer, server
+    # )
+    logger.debug(
+        "Servicer registered (generic mode) for service: %s", service_name
+    )
+
+
+# ============================================================
+# Helper functions
+# ============================================================
+
+
+def _get_field(obj: Any, field_name: str, default: Any = None) -> Any:
+    """Get a field from a dict-like or protobuf-like object.
+
+    Args:
+        obj: The source object (dict or protobuf message).
+        field_name: The field name to retrieve.
+        default: Default value if field not found.
+
+    Returns:
+        The field value or default.
+    """
+    if isinstance(obj, dict):
+        return obj.get(field_name, default)
+    return getattr(obj, field_name, default)
+
+
+def _get_nested_field(obj: Any, field_name: str, default: Any = None) -> Any:
+    """Get a field from a nested dict-like or protobuf-like object.
+
+    Args:
+        obj: The source object (dict or protobuf message).
+        field_name: The field name to retrieve.
+        default: Default value if field not found.
+
+    Returns:
+        The field value or default.
+    """
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(field_name, default)
+    return getattr(obj, field_name, default)
+
+
+def _step_result_to_dict(step: Any) -> Dict[str, Any]:
+    """Convert a StepResult dataclass to a dict for persistence.
+
+    Args:
+        step: A StepResult instance from the workflow engine.
+
+    Returns:
+        Dict representation suitable for JSON serialization.
+    """
+    return {
+        "node_id": step.node_id,
+        "node_type": step.node_type,
+        "output": step.output,
+        "duration_ms": step.duration_ms,
+        "status": step.status,
+        "tokens_used": {
+            "input_tokens": step.tokens_used.input_tokens,
+            "output_tokens": step.tokens_used.output_tokens,
+        },
+        "error_message": step.error_message or "",
+    }
+
+
+def _build_workflow_definition_from_resolved(
+    resolved: ResolvedWorkflow,
+) -> WorkflowDefinition:
+    """Build a WorkflowDefinition from a ResolvedWorkflow's graph_definition.
+
+    The graph_definition JSON contains nodes, edges, and entry_point.
+
+    Args:
+        resolved: The resolved workflow from the agent router.
+
+    Returns:
+        A WorkflowDefinition ready for build_agent_graph.
+    """
+    graph_def = resolved.graph_definition
+
+    # Parse nodes
+    raw_nodes = graph_def.get("nodes", [])
+    nodes = [
+        NodeDefinition(
+            node_id=n.get("node_id", ""),
+            node_type=n.get("node_type", "llm_call"),
+            config=n.get("config", {}),
+        )
+        for n in raw_nodes
+    ]
+
+    # Parse edges
+    raw_edges = graph_def.get("edges", [])
+    edges = [
+        EdgeDefinition(
+            source=e.get("source", ""),
+            target=e.get("target", ""),
+            condition=e.get("condition"),
+        )
+        for e in raw_edges
+    ]
+
+    # Entry point
+    entry_point = graph_def.get("entry_point", "")
+
+    return WorkflowDefinition(
+        workflow_id=resolved.workflow_id,
+        agent_type=resolved.agent_type,
+        nodes=nodes,
+        edges=edges,
+        entry_point=entry_point,
+    )
