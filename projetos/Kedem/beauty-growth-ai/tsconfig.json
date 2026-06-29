@@ -34,7 +34,8 @@
       "@prompt-registry/*": ["src/modules/prompt-registry/*"],
       "@guardrails/*": ["src/modules/guardrails/*"],
       "@privacy/*": ["src/modules/privacy/*"],
-      "@observability/*": ["src/modules/observability/*"]
+      "@observability/*": ["src/modules/observability/*"],
+      "@event-bus/*": ["src/modules/event-bus/*"]
     }
   },
   "include": ["src"],
