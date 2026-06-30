@@ -6,10 +6,12 @@ import { GuardrailsService } from './services/guardrails.service';
 import { Guardrail } from './entities/guardrail.entity';
 import { GuardrailViolation } from './entities/guardrail-violation.entity';
 import { GuardrailVersion } from './entities/guardrail-version.entity';
+import { CacheModule } from '../cache/cache.module';
 
 @Module({
   imports: [
     TypeOrmModule.forFeature([Guardrail, GuardrailViolation, GuardrailVersion]),
+    CacheModule.forFeature({ resourceName: 'guardrails' }),
   ],
   controllers: [GuardrailsController],
   providers: [GuardrailsService],

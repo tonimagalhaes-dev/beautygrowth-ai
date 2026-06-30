@@ -7,6 +7,8 @@ from typing import Any, Dict, List, Optional, Protocol
 
 import asyncpg
 
+from .tenant_context import tenant_connection
+
 logger = logging.getLogger(__name__)
 
 # UUID v4 pattern (also accepts other UUID versions for flexibility)
@@ -138,11 +140,14 @@ class PostgresAgentRouter:
 
         Algorithm:
         1. Validate agent_id format (must be a valid UUID)
-        2. Query agent_configs to get agent_type for the given agent_id
-        3. Set app.current_tenant session variable for RLS
+        2. Acquire connection with tenant context (SET LOCAL app.current_tenant)
+        3. Query agent_configs to get agent_type for the given agent_id
         4. Query workflow_definitions for active workflows matching agent_type
         5. Prioritize tenant-specific workflow over global (tenant_id IS NULL)
         6. If multiple versions exist for the winning scope, pick highest version
+
+        Uses tenant_connection context manager to ensure RLS policies are
+        enforced via SET LOCAL within a transaction.
 
         Args:
             agent_id: UUID of the agent to resolve workflow for.
@@ -168,12 +173,7 @@ class PostgresAgentRouter:
             )
 
         try:
-            async with self._pool.acquire() as conn:
-                # Set RLS session variable
-                await conn.execute(
-                    "SELECT set_config('app.current_tenant', $1, true)", tenant_id
-                )
-
+            async with tenant_connection(self._pool, tenant_id) as conn:
                 # Step 1: Get agent_type from agent_configs
                 agent_row = await conn.fetchrow(
                     "SELECT agent_type FROM agent_configs WHERE id = $1",

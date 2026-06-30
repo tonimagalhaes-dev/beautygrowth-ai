@@ -2,11 +2,14 @@
 
 Implements:
 - TenantValidationInterceptor: validates x-tenant-id metadata on every RPC call
+- CrossTenantValidationInterceptor: cross-cutting interceptor that validates metadata
+  tenant_id matches payload tenant_id for ALL RPCs, and logs cross-tenant attempts
 - validate_tenant_payload_match: utility to compare metadata tenant_id vs payload tenant_id
 - UUID validation helper
 - Context propagation via Python contextvars
+- Audit logging for cross-tenant access attempts
 
-Requirements: 5.5, 5.6, 5.7
+Requirements: 5.4, 5.5, 5.6, 5.7
 """
 
 from __future__ import annotations
@@ -14,20 +17,18 @@ from __future__ import annotations
 import logging
 import re
 from contextvars import ContextVar
-from typing import Any, Callable, Tuple
+from datetime import datetime, timezone
+from typing import Any, Callable, List, Tuple
 
 import grpc
 from grpc import aio
 
+from ..core.context_vars import tenant_id_var, trace_id_var, user_id_var
+
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Context variables for propagating tenant/trace/user across async call stack
-# ---------------------------------------------------------------------------
-
-tenant_id_var: ContextVar[str] = ContextVar("tenant_id_var", default="")
-trace_id_var: ContextVar[str] = ContextVar("trace_id_var", default="")
-user_id_var: ContextVar[str] = ContextVar("user_id_var", default="")
+# Dedicated audit logger for cross-tenant access attempts
+audit_logger = logging.getLogger("audit.cross_tenant")
 
 # ---------------------------------------------------------------------------
 # UUID validation
@@ -141,6 +142,326 @@ class TenantValidationInterceptor(aio.ServerInterceptor):
         user_id_var.set(user_id)
 
         return await continuation(handler_call_details)
+
+
+# ---------------------------------------------------------------------------
+# Cross-Tenant Validation Interceptor (Cross-cutting)
+# ---------------------------------------------------------------------------
+
+
+def _extract_payload_tenant_id(request: Any) -> str | None:
+    """Extract tenant_id from request payload.
+
+    Supports dict-like and protobuf-like request objects.
+
+    Args:
+        request: The deserialized request payload.
+
+    Returns:
+        The tenant_id string if found, None otherwise.
+    """
+    if request is None:
+        return None
+    if isinstance(request, dict):
+        return request.get("tenant_id")
+    return getattr(request, "tenant_id", None)
+
+
+class CrossTenantValidationInterceptor(aio.ServerInterceptor):
+    """gRPC server interceptor that validates metadata tenant_id matches payload.
+
+    This is a cross-cutting concern: for ALL RPCs that carry a tenant_id
+    in the payload, the interceptor ensures it matches the x-tenant-id from
+    gRPC metadata. If there's a mismatch, the call is rejected with
+    PERMISSION_DENIED and the attempt is logged in the audit log.
+
+    This interceptor wraps the handler to perform post-deserialization validation.
+
+    Requirements: 5.4, 5.6, 5.7
+    """
+
+    def __init__(self, audit_log_store: AuditLogStore | None = None) -> None:
+        """Initialize the cross-tenant validation interceptor.
+
+        Args:
+            audit_log_store: Optional persistent audit log store for recording
+                cross-tenant access attempts. If None, only logs to audit_logger.
+        """
+        self._audit_log_store = audit_log_store
+
+    async def intercept_service(
+        self,
+        continuation: Callable,
+        handler_call_details: grpc.HandlerCallDetails,
+    ) -> Any:
+        """Intercept and wrap handler to validate tenant consistency post-deserialization.
+
+        Args:
+            continuation: The next handler in the chain.
+            handler_call_details: Details about the incoming RPC call.
+
+        Returns:
+            A wrapped handler that validates tenant_id match after deserialization.
+        """
+        # Get the original handler from the chain
+        handler = await continuation(handler_call_details)
+
+        if handler is None:
+            return handler
+
+        # Wrap the handler's unary_unary or unary_stream to inject validation
+        method = handler_call_details.method or ""
+
+        if handler.unary_unary:
+            original_fn = handler.unary_unary
+            wrapped_fn = self._wrap_unary_unary(original_fn, method)
+            return grpc.unary_unary_rpc_method_handler(
+                wrapped_fn,
+                request_deserializer=handler.request_deserializer,
+                response_serializer=handler.response_serializer,
+            )
+
+        if handler.unary_stream:
+            original_fn = handler.unary_stream
+            wrapped_fn = self._wrap_unary_stream(original_fn, method)
+            return grpc.unary_stream_rpc_method_handler(
+                wrapped_fn,
+                request_deserializer=handler.request_deserializer,
+                response_serializer=handler.response_serializer,
+            )
+
+        # For stream_unary and stream_stream, return as-is (no payload tenant to check)
+        return handler
+
+    def _wrap_unary_unary(self, original_fn: Callable, method: str) -> Callable:
+        """Wrap a unary-unary handler to inject tenant validation.
+
+        Args:
+            original_fn: The original handler function.
+            method: The gRPC method name for logging.
+
+        Returns:
+            A wrapped async function with tenant validation.
+        """
+        interceptor = self
+
+        async def _wrapped(request: Any, context: grpc.aio.ServicerContext) -> Any:
+            if not await interceptor._validate_cross_tenant(request, context, method):
+                return None
+            return await original_fn(request, context)
+
+        return _wrapped
+
+    def _wrap_unary_stream(self, original_fn: Callable, method: str) -> Callable:
+        """Wrap a unary-stream handler to inject tenant validation.
+
+        Args:
+            original_fn: The original handler function.
+            method: The gRPC method name for logging.
+
+        Returns:
+            A wrapped async generator with tenant validation.
+        """
+        interceptor = self
+
+        async def _wrapped(request: Any, context: grpc.aio.ServicerContext):
+            if not await interceptor._validate_cross_tenant(request, context, method):
+                return
+            async for item in original_fn(request, context):
+                yield item
+
+        return _wrapped
+
+    async def _validate_cross_tenant(
+        self,
+        request: Any,
+        context: grpc.aio.ServicerContext,
+        method: str,
+    ) -> bool:
+        """Validate that metadata tenant_id matches payload tenant_id.
+
+        Logs cross-tenant access attempts to the audit log and rejects with
+        PERMISSION_DENIED.
+
+        Args:
+            request: The deserialized request payload.
+            context: The gRPC servicer context.
+            method: The gRPC method name.
+
+        Returns:
+            True if validation passes, False if the call was aborted.
+        """
+        metadata_tenant_id = tenant_id_var.get()
+        payload_tenant_id = _extract_payload_tenant_id(request)
+
+        # If there's no tenant_id in payload, skip cross-tenant validation
+        # (e.g., HealthCheck requests don't carry tenant_id in payload)
+        if not payload_tenant_id:
+            return True
+
+        # If they match, validation passes
+        if metadata_tenant_id == payload_tenant_id:
+            return True
+
+        # Cross-tenant access attempt detected!
+        trace_id = trace_id_var.get()
+        user_id = user_id_var.get()
+
+        # Log the audit event
+        audit_entry = CrossTenantAuditEntry(
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            trace_id=trace_id,
+            user_id=user_id,
+            method=method,
+            metadata_tenant_id=metadata_tenant_id,
+            payload_tenant_id=payload_tenant_id,
+        )
+
+        audit_logger.warning(
+            "CROSS-TENANT ACCESS ATTEMPT: method=%s, metadata_tenant=%s, "
+            "payload_tenant=%s, trace_id=%s, user_id=%s",
+            method,
+            metadata_tenant_id,
+            payload_tenant_id,
+            trace_id,
+            user_id,
+        )
+
+        # Persist to audit log store if available
+        if self._audit_log_store:
+            await self._audit_log_store.record(audit_entry)
+
+        # Reject with PERMISSION_DENIED
+        await context.abort(
+            grpc.StatusCode.PERMISSION_DENIED,
+            "Metadata tenant_id does not match payload tenant_id",
+        )
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Audit logging types and store
+# ---------------------------------------------------------------------------
+
+
+class CrossTenantAuditEntry:
+    """Represents an audit log entry for a cross-tenant access attempt.
+
+    Attributes:
+        timestamp: ISO timestamp of the attempt.
+        trace_id: The trace ID from the request.
+        user_id: The user ID that attempted the cross-tenant access.
+        method: The gRPC method being called.
+        metadata_tenant_id: The tenant_id from gRPC metadata (authenticated).
+        payload_tenant_id: The tenant_id in the request payload (target).
+    """
+
+    def __init__(
+        self,
+        timestamp: str,
+        trace_id: str,
+        user_id: str,
+        method: str,
+        metadata_tenant_id: str,
+        payload_tenant_id: str,
+    ) -> None:
+        self.timestamp = timestamp
+        self.trace_id = trace_id
+        self.user_id = user_id
+        self.method = method
+        self.metadata_tenant_id = metadata_tenant_id
+        self.payload_tenant_id = payload_tenant_id
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for serialization."""
+        return {
+            "timestamp": self.timestamp,
+            "trace_id": self.trace_id,
+            "user_id": self.user_id,
+            "method": self.method,
+            "metadata_tenant_id": self.metadata_tenant_id,
+            "payload_tenant_id": self.payload_tenant_id,
+            "event_type": "cross_tenant_access_attempt",
+        }
+
+
+class AuditLogStore:
+    """Interface for persisting audit log entries.
+
+    Subclass this to implement persistence to PostgreSQL, file system,
+    or external logging services.
+    """
+
+    async def record(self, entry: CrossTenantAuditEntry) -> None:
+        """Record an audit log entry.
+
+        Args:
+            entry: The audit entry to persist.
+        """
+        raise NotImplementedError
+
+
+class PostgresAuditLogStore(AuditLogStore):
+    """Audit log store that persists entries to PostgreSQL audit_logs table.
+
+    Requires an asyncpg connection pool.
+    """
+
+    def __init__(self, pg_pool: Any) -> None:
+        """Initialize with PostgreSQL connection pool.
+
+        Args:
+            pg_pool: asyncpg pool for database access.
+        """
+        self._pg_pool = pg_pool
+
+    async def record(self, entry: CrossTenantAuditEntry) -> None:
+        """Record a cross-tenant access attempt in the audit_logs table.
+
+        Args:
+            entry: The audit entry to persist.
+        """
+        try:
+            async with self._pg_pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO audit_logs (
+                        event_type, trace_id, user_id, method,
+                        metadata_tenant_id, payload_tenant_id, created_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, NOW())
+                    """,
+                    "cross_tenant_access_attempt",
+                    entry.trace_id,
+                    entry.user_id,
+                    entry.method,
+                    entry.metadata_tenant_id,
+                    entry.payload_tenant_id,
+                )
+        except Exception as e:
+            # Never let audit logging failure break the main flow
+            logger.error(
+                "Failed to persist audit log entry: %s (trace_id=%s)",
+                str(e),
+                entry.trace_id,
+            )
+
+
+class InMemoryAuditLogStore(AuditLogStore):
+    """In-memory audit log store for testing.
+
+    Stores entries in a list for easy assertion in tests.
+    """
+
+    def __init__(self) -> None:
+        self.entries: List[CrossTenantAuditEntry] = []
+
+    async def record(self, entry: CrossTenantAuditEntry) -> None:
+        """Record an audit entry in memory.
+
+        Args:
+            entry: The audit entry to store.
+        """
+        self.entries.append(entry)
 
 
 # ---------------------------------------------------------------------------

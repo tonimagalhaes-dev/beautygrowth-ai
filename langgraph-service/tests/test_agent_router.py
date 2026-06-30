@@ -2,6 +2,7 @@
 
 import json
 import sys
+import types
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -11,9 +12,42 @@ import pytest
 # graph_builder which requires Python 3.10+ match syntax
 import importlib.util
 
-_module_path = Path(__file__).parent.parent / "src" / "core" / "agent_router.py"
-_spec = importlib.util.spec_from_file_location("agent_router", _module_path)
+_service_root = Path(__file__).parent.parent
+sys.path.insert(0, str(_service_root))
+
+# Set up package structure in sys.modules so relative imports work
+if "src" not in sys.modules:
+    src_pkg = types.ModuleType("src")
+    src_pkg.__path__ = [str(_service_root / "src")]
+    sys.modules["src"] = src_pkg
+
+if "src.core" not in sys.modules:
+    core_pkg = types.ModuleType("src.core")
+    core_pkg.__path__ = [str(_service_root / "src" / "core")]
+    sys.modules["src.core"] = core_pkg
+
+# Load context_vars first (leaf dependency, no circular imports)
+_cv_path = _service_root / "src" / "core" / "context_vars.py"
+_cv_spec = importlib.util.spec_from_file_location("src.core.context_vars", _cv_path)
+_cv_mod = importlib.util.module_from_spec(_cv_spec)
+_cv_mod.__package__ = "src.core"
+sys.modules["src.core.context_vars"] = _cv_mod
+_cv_spec.loader.exec_module(_cv_mod)
+
+# Load tenant_context (depends on context_vars)
+_tc_path = _service_root / "src" / "core" / "tenant_context.py"
+_tc_spec = importlib.util.spec_from_file_location("src.core.tenant_context", _tc_path)
+_tc_mod = importlib.util.module_from_spec(_tc_spec)
+_tc_mod.__package__ = "src.core"
+sys.modules["src.core.tenant_context"] = _tc_mod
+_tc_spec.loader.exec_module(_tc_mod)
+
+# Load agent_router (depends on tenant_context)
+_module_path = _service_root / "src" / "core" / "agent_router.py"
+_spec = importlib.util.spec_from_file_location("src.core.agent_router", _module_path)
 _agent_router_mod = importlib.util.module_from_spec(_spec)
+_agent_router_mod.__package__ = "src.core"
+sys.modules["src.core.agent_router"] = _agent_router_mod
 _spec.loader.exec_module(_agent_router_mod)
 
 AgentNotFoundError = _agent_router_mod.AgentNotFoundError
@@ -74,8 +108,16 @@ class _AsyncContextManager:
 
 
 def _setup_connection(mock_pool, mock_connection):
-    """Helper to set up pool.acquire() to return mock connection as async context manager."""
+    """Helper to set up pool.acquire() to return mock connection as async context manager.
+
+    Also sets up conn.transaction() as an async context manager since
+    tenant_connection wraps queries in a transaction.
+    """
     mock_pool.acquire = MagicMock(return_value=_AsyncContextManager(mock_connection))
+    # tenant_connection uses conn.transaction() as an async context manager
+    mock_connection.transaction = MagicMock(
+        return_value=_AsyncContextManager(None)
+    )
 
 
 # --- Tests ---

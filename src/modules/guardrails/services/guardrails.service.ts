@@ -1,6 +1,6 @@
 import {
-  BadRequestException,
   ForbiddenException,
+  Inject,
   Injectable,
   Logger,
   NotFoundException,
@@ -23,6 +23,13 @@ import {
   GuardrailRule,
   RegenerationResult,
 } from '../interfaces/guardrails-service.interface';
+import { ICacheService } from '../../cache/interfaces/cache-service.interface';
+import { CacheKeyBuilder } from '../../cache/services/cache-key-builder.service';
+import {
+  CACHE_SERVICE,
+  GUARDRAILS_TENANT_TTL,
+  GUARDRAILS_SYSTEM_TTL,
+} from '../../cache/config/cache.constants';
 
 /**
  * Default system guardrails that cannot be disabled, edited, or deleted.
@@ -94,11 +101,6 @@ const SYSTEM_GUARDRAILS_DEFINITIONS: Array<{
 export class GuardrailsService implements IGuardrailsService {
   private readonly logger = new Logger(GuardrailsService.name);
 
-  /** In-memory cache of active guardrails for fast validation. */
-  private guardrailCache: Map<string, Guardrail[]> = new Map();
-  private cacheLastUpdated: Map<string, number> = new Map();
-  private readonly CACHE_TTL_MS = 60_000; // 60s — new guardrails apply within 60s
-
   constructor(
     @InjectRepository(Guardrail)
     private readonly guardrailRepository: Repository<Guardrail>,
@@ -107,6 +109,8 @@ export class GuardrailsService implements IGuardrailsService {
     @InjectRepository(GuardrailVersion)
     private readonly versionRepository: Repository<GuardrailVersion>,
     private readonly eventEmitter: EventEmitter2,
+    @Inject(CACHE_SERVICE) private readonly cache: ICacheService,
+    private readonly keyBuilder: CacheKeyBuilder,
   ) {}
 
   // =========================================================================
@@ -266,8 +270,10 @@ export class GuardrailsService implements IGuardrailsService {
     // Save initial version for rollback
     await this.saveVersion(saved, null);
 
-    // Invalidate cache so new guardrail applies within 60s
-    this.invalidateCache(tenantId);
+    // Invalidate distributed cache so new guardrail applies immediately
+    await this.cache.delete(
+      this.keyBuilder.tenantKey(tenantId, 'guardrails', 'active'),
+    );
 
     this.eventEmitter.emit('guardrails.created', {
       tenantId,
@@ -318,8 +324,10 @@ export class GuardrailsService implements IGuardrailsService {
 
     const saved = await this.guardrailRepository.save(guardrail);
 
-    // Invalidate cache so updated guardrail applies within 60s
-    this.invalidateCache(guardrail.tenantId!);
+    // Invalidate distributed cache so updated guardrail applies immediately
+    await this.cache.delete(
+      this.keyBuilder.tenantKey(guardrail.tenantId!, 'guardrails', 'active'),
+    );
 
     this.eventEmitter.emit('guardrails.updated', {
       tenantId: guardrail.tenantId,
@@ -368,8 +376,10 @@ export class GuardrailsService implements IGuardrailsService {
 
     const saved = await this.guardrailRepository.save(guardrail);
 
-    // Invalidate cache
-    this.invalidateCache(guardrail.tenantId!);
+    // Invalidate distributed cache
+    await this.cache.delete(
+      this.keyBuilder.tenantKey(guardrail.tenantId!, 'guardrails', 'active'),
+    );
 
     this.logger.log(
       `Rolled back guardrail "${saved.name}" to version ${version} (new version: ${saved.version})`,
@@ -390,7 +400,11 @@ export class GuardrailsService implements IGuardrailsService {
     }
 
     await this.guardrailRepository.remove(guardrail);
-    this.invalidateCache(guardrail.tenantId!);
+
+    // Invalidate distributed cache
+    await this.cache.delete(
+      this.keyBuilder.tenantKey(guardrail.tenantId!, 'guardrails', 'active'),
+    );
 
     this.logger.log(`Deleted guardrail "${guardrail.name}"`);
   }
@@ -495,31 +509,40 @@ export class GuardrailsService implements IGuardrailsService {
   // =========================================================================
 
   /**
-   * Get all active guardrails (system + tenant) with caching.
-   * Cache TTL is 60s to meet the "apply within 60s" requirement.
+   * Get all active guardrails (system + tenant) with distributed cache.
+   * Implements cache-aside pattern: check cache → on miss, query DB and populate cache.
    */
   private async getActiveGuardrails(tenantId: string): Promise<Guardrail[]> {
-    const cacheKey = `active_${tenantId}`;
-    const lastUpdated = this.cacheLastUpdated.get(cacheKey) || 0;
-    const now = Date.now();
-
-    if (now - lastUpdated < this.CACHE_TTL_MS && this.guardrailCache.has(cacheKey)) {
-      return this.guardrailCache.get(cacheKey)!;
+    // 1. Try tenant cache (combined system + tenant guardrails)
+    const tenantCacheKey = this.keyBuilder.tenantKey(
+      tenantId,
+      'guardrails',
+      'active',
+    );
+    const cachedTenant = await this.cache.get<Guardrail[]>(tenantCacheKey);
+    if (cachedTenant) {
+      return cachedTenant;
     }
 
-    // Fetch system guardrails + tenant guardrails
-    const [systemGuardrails, tenantGuardrails] = await Promise.all([
-      this.guardrailRepository.find({
+    // 2. Cache miss — fetch system guardrails (try system cache first)
+    const systemCacheKey = this.keyBuilder.globalKey('guardrails', 'system');
+    let systemGuardrails = await this.cache.get<Guardrail[]>(systemCacheKey);
+    if (!systemGuardrails) {
+      // System cache miss — fetch from DB and populate
+      systemGuardrails = await this.guardrailRepository.find({
         where: { type: 'system', isActive: true },
-      }),
-      this.guardrailRepository.find({
-        where: { tenantId, type: 'tenant', isActive: true },
-      }),
-    ]);
+      });
+      await this.cache.set(systemCacheKey, systemGuardrails, GUARDRAILS_SYSTEM_TTL);
+    }
 
+    // 3. Fetch tenant guardrails from DB
+    const tenantGuardrails = await this.guardrailRepository.find({
+      where: { tenantId, type: 'tenant', isActive: true },
+    });
+
+    // 4. Combine and cache
     const all = [...systemGuardrails, ...tenantGuardrails];
-    this.guardrailCache.set(cacheKey, all);
-    this.cacheLastUpdated.set(cacheKey, now);
+    await this.cache.set(tenantCacheKey, all, GUARDRAILS_TENANT_TTL);
 
     return all;
   }
@@ -657,15 +680,6 @@ export class GuardrailsService implements IGuardrailsService {
     });
 
     await this.versionRepository.save(versionEntry);
-  }
-
-  /**
-   * Invalidate the cache for a tenant (forces re-fetch within next validation).
-   */
-  private invalidateCache(tenantId: string): void {
-    const cacheKey = `active_${tenantId}`;
-    this.guardrailCache.delete(cacheKey);
-    this.cacheLastUpdated.delete(cacheKey);
   }
 
   /**

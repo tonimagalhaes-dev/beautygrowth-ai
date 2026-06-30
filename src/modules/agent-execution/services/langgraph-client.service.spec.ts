@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import * as grpc from '@grpc/grpc-js';
 
 import { LangGraphClientService } from './langgraph-client.service';
+import { GrpcErrorHandler } from './grpc-error-handler';
 
 /**
  * Unit tests for LangGraphClientService.
@@ -30,6 +31,7 @@ describe('LangGraphClientService', () => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         LangGraphClientService,
+        GrpcErrorHandler,
         {
           provide: ConfigService,
           useValue: {
@@ -141,6 +143,7 @@ describe('LangGraphClientService', () => {
       const module: TestingModule = await Test.createTestingModule({
         providers: [
           LangGraphClientService,
+          GrpcErrorHandler,
           {
             provide: ConfigService,
             useValue: {

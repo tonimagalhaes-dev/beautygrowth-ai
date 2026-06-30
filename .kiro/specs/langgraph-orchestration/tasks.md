@@ -155,12 +155,12 @@ Implementação da camada de orquestração LangGraph como microsserviço Python
     - Configurar timeout de 30s por chamada
     - _Requirements: 1.1, 1.3, 1.5, 1.7_
 
-  - [-] 7.2 Implementar serialização/deserialização protobuf no client
+  - [x] 7.2 Implementar serialização/deserialização protobuf no client
     - Serializar requests em formato protobuf conforme schema do AgentOrchestrationService
     - Deserializar respostas em objetos TypeScript correspondentes (ExecuteWorkflowResponse, ExecutionState, etc.)
     - _Requirements: 1.2, 1.4_
 
-  - [-] 7.3 Implementar tratamento de erros gRPC no client
+  - [x] 7.3 Implementar tratamento de erros gRPC no client
     - Para erros UNAVAILABLE, DEADLINE_EXCEEDED ou deserialização: retornar erro tipado com código gRPC, mensagem e trace_id
     - Em timeout: encerrar chamada e propagar erro sem manter conexão pendente
     - _Requirements: 1.6, 1.7_
@@ -170,7 +170,7 @@ Implementação da camada de orquestração LangGraph como microsserviço Python
     - Gerar ExecuteWorkflowRequest e ExecuteWorkflowResponse arbitrários com fast-check; validar deep equality após serialização/deserialização
     - **Validates: Requirements 1.4**
 
-- [ ] 8. Implementar Circuit Breaker e Fallback (TypeScript)
+- [x] 8. Implementar Circuit Breaker e Fallback (TypeScript)
   - [x] 8.1 Implementar `CircuitBreakerService` com transições de estado
     - Implementar interface `ICircuitBreaker` conforme design
     - Estados: CLOSED, OPEN, HALF_OPEN com transições válidas conforme requisito 2.7
@@ -180,7 +180,7 @@ Implementação da camada de orquestração LangGraph como microsserviço Python
     - Em HALF_OPEN: permitir uma chamada teste; sucesso incrementa successCount, falha volta para OPEN
     - _Requirements: 2.1, 2.3, 2.4, 2.5, 2.7, 2.8, 2.9_
 
-  - [-] 8.2 Implementar `FallbackHandler` para pipeline local simplificado
+  - [x] 8.2 Implementar `FallbackHandler` para pipeline local simplificado
     - Chamar LLM diretamente sem passar pelo LangGraph Service
     - Retornar resposta com flag `usedFallback=true`
     - Não produzir efeitos colaterais no LangGraph Service
@@ -196,56 +196,56 @@ Implementação da camada de orquestração LangGraph como microsserviço Python
     - Com circuit breaker OPEN, validar que fallback sempre retorna resultado com usedFallback=true e não tenta contatar LangGraph
     - **Validates: Requirements 2.2, 2.6**
 
-- [~] 9. Checkpoint - Verificar integração NestJS ↔ LangGraph
+- [x] 9. Checkpoint - Verificar integração NestJS ↔ LangGraph
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 10. Implementar Streaming de Resultados Parciais
-  - [-] 10.1 Implementar handler `ExecuteWorkflowStream` no gRPC server (Python)
+- [x] 10. Implementar Streaming de Resultados Parciais
+  - [x] 10.1 Implementar handler `ExecuteWorkflowStream` no gRPC server (Python)
     - Emitir eventos `WorkflowStreamEvent` via stream gRPC server-side na ordem cronológica
     - Emitir `StepStarted` ao iniciar nó, `StepCompleted` ao completar, `TokenGenerated` durante LLM
     - Emitir `WorkflowCompleted` ou `WorkflowError` como último evento e fechar stream
     - Se `enable_streaming=false`: emitir apenas evento terminal
     - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.5, 6.6, 6.7_
 
-  - [~] 10.2 Implementar consumo de stream gRPC no NestJS client
+  - [x] 10.2 Implementar consumo de stream gRPC no NestJS client
     - Implementar `executeWorkflowStream` retornando `AsyncIterable<WorkflowStreamEvent>`
     - Se conexão interrompida: LangGraph continua execução e persiste resultado para consulta posterior
     - _Requirements: 6.8_
 
-- [ ] 11. Implementar Cancelamento de Execução
-  - [-] 11.1 Implementar handler `CancelExecution` no gRPC server (Python)
+- [x] 11. Implementar Cancelamento de Execução
+  - [x] 11.1 Implementar handler `CancelExecution` no gRPC server (Python)
     - Interromper execução no nó atual e atualizar status para CANCELLED
     - Persistir estado parcial com steps completados, current_node e duration_ms
     - Se execução já concluída: retornar success=false com mensagem indicando status atual
     - Se execution_id não existe ou não pertence ao tenant: retornar success=false sem revelar existência para outro tenant
     - _Requirements: 7.1, 7.2, 7.3, 7.4_
 
-- [ ] 12. Integrar AgentExecutionModule do NestJS com gRPC Client
-  - [~] 12.1 Refatorar `AgentExecutionService` para delegar ao LangGraph via gRPC
+- [x] 12. Integrar AgentExecutionModule do NestJS com gRPC Client
+  - [x] 12.1 Refatorar `AgentExecutionService` para delegar ao LangGraph via gRPC
     - Modificar o service existente para usar `LangGraphClientService` em vez de execução local
     - Integrar circuit breaker na cadeia de chamadas
     - Manter interface pública do controller inalterada
     - _Requirements: 1.1, 2.2_
 
-  - [~] 12.2 Registrar módulo gRPC e dependências no `AgentExecutionModule`
+  - [x] 12.2 Registrar módulo gRPC e dependências no `AgentExecutionModule`
     - Adicionar `LangGraphClientService`, `CircuitBreakerService` e `FallbackHandler` como providers
     - Configurar variáveis de ambiente para host/porta do LangGraph e configuração do circuit breaker
     - _Requirements: 1.5_
 
-- [ ] 13. Implementar isolamento multi-tenant end-to-end
-  - [~] 13.1 Implementar validação de tenant cross-cutting no LangGraph Service
+- [x] 13. Implementar isolamento multi-tenant end-to-end
+  - [x] 13.1 Implementar validação de tenant cross-cutting no LangGraph Service
     - Interceptor gRPC que extrai e valida tenant_id em todas as chamadas
     - Rejeitar com PERMISSION_DENIED se tenant_id do metadata diverge do payload
     - Registrar tentativas de acesso cross-tenant no audit_logs
     - _Requirements: 5.4, 5.6, 5.7_
 
-  - [~] 13.2 Implementar RLS e set de session variable no acesso ao PostgreSQL
+  - [x] 13.2 Implementar RLS e set de session variable no acesso ao PostgreSQL
     - Antes de cada query, setar `app.current_tenant` via `SET LOCAL` na transação
     - Garantir que RLS policies estão ativas nas tabelas workflow_executions e workflow_definitions
     - _Requirements: 5.2_
 
-- [ ] 14. Implementar persistência e métricas de execução
-  - [~] 14.1 Garantir que toda execução (sucesso ou falha) persiste estado final e métricas
+- [x] 14. Implementar persistência e métricas de execução
+  - [x] 14.1 Garantir que toda execução (sucesso ou falha) persiste estado final e métricas
     - Toda execução com status terminal (COMPLETED, FAILED, CANCELLED, TIMEOUT) deve gravar no PostgreSQL
     - Registrar duration_ms e tokens_used (input + output) em todas as execuções
     - Se persistência falha: logar com trace_id e execution_id, retornar FAILED com indicação

@@ -305,13 +305,159 @@ class LangGraphWorkflowEngine:
     ) -> AsyncIterator[WorkflowEvent]:
         """Execute a workflow with streaming of partial events.
 
-        Placeholder implementation — will be fully implemented in a later task.
+        Executes the workflow and replays events from the steps list in
+        chronological order. For each step:
+          - Yields StepStarted before execution
+          - Yields StepCompleted after execution
+        At the end:
+          - Yields WorkflowCompleted on success
+          - Yields WorkflowError on failure
+
+        Args:
+            workflow_id: The registered workflow to execute.
+            initial_state: Initial state dict to pass to the graph.
+            config: Execution configuration (timeout, max_steps, tenant info).
+
+        Yields:
+            WorkflowEvent instances in chronological order.
+
+        Raises:
+            WorkflowNotFoundError: If workflow_id is not registered.
         """
-        result = await self.execute(workflow_id, initial_state, config)
-        yield WorkflowEvent(
-            event_type="workflow_completed",
-            data={"output": result.output, "success": result.success},
-        )
+        if workflow_id not in self._workflows:
+            raise WorkflowNotFoundError(
+                f"Workflow '{workflow_id}' not found. "
+                f"Registered workflows: {sorted(self._workflows.keys())}"
+            )
+
+        graph = self._workflows[workflow_id]
+        execution_id = str(uuid.uuid4())
+
+        # Build LangGraph config with recursion_limit and thread_id
+        lg_config = {
+            "configurable": {"thread_id": execution_id},
+            "recursion_limit": config.max_steps,
+        }
+
+        start_time = time.perf_counter()
+        timeout_seconds = config.timeout_ms / 1000
+
+        try:
+            # Execute with timeout enforcement
+            result = await asyncio.wait_for(
+                graph.ainvoke(initial_state, config=lg_config),
+                timeout=timeout_seconds,
+            )
+
+            duration_ms = int((time.perf_counter() - start_time) * 1000)
+
+            # Extract steps from graph result
+            steps = self._extract_steps(result)
+
+            # Aggregate token usage from steps
+            tokens_used = self._aggregate_tokens(steps)
+
+            output = result.get("output", "")
+
+            # Emit StepStarted and StepCompleted for each step
+            for step in steps:
+                yield WorkflowEvent(
+                    event_type="step_started",
+                    node_id=step.node_id,
+                    data={"node_type": step.node_type},
+                )
+                yield WorkflowEvent(
+                    event_type="step_completed",
+                    node_id=step.node_id,
+                    data={
+                        "result": {
+                            "node_id": step.node_id,
+                            "node_type": step.node_type,
+                            "output": step.output,
+                            "duration_ms": step.duration_ms,
+                            "status": step.status,
+                            "tokens_used": {
+                                "input_tokens": step.tokens_used.input_tokens,
+                                "output_tokens": step.tokens_used.output_tokens,
+                            },
+                            "error_message": step.error_message or "",
+                        }
+                    },
+                )
+
+            # Emit terminal event: WorkflowCompleted
+            yield WorkflowEvent(
+                event_type="workflow_completed",
+                data={
+                    "output": output,
+                    "success": True,
+                    "trace_id": config.trace_id,
+                    "model_id": result.get("model_id", ""),
+                    "duration_ms": duration_ms,
+                    "tokens_used": {
+                        "input_tokens": tokens_used.input_tokens,
+                        "output_tokens": tokens_used.output_tokens,
+                    },
+                },
+            )
+
+        except asyncio.TimeoutError:
+            duration_ms = int((time.perf_counter() - start_time) * 1000)
+            yield WorkflowEvent(
+                event_type="workflow_error",
+                data={
+                    "error_code": "TIMEOUT",
+                    "error_message": f"Execution exceeded {config.timeout_ms}ms limit",
+                },
+            )
+
+        except GuardrailViolationError as e:
+            duration_ms = int((time.perf_counter() - start_time) * 1000)
+            yield WorkflowEvent(
+                event_type="workflow_error",
+                node_id=e.node_id,
+                data={
+                    "error_code": "GUARDRAIL_VIOLATION",
+                    "error_message": f"Guardrail violation at node {e.node_id}: {e.violations}",
+                },
+            )
+
+        except NodeExecutionError as e:
+            duration_ms = int((time.perf_counter() - start_time) * 1000)
+            yield WorkflowEvent(
+                event_type="workflow_error",
+                node_id=e.node_id,
+                data={
+                    "error_code": "NODE_EXECUTION_ERROR",
+                    "error_message": f"Node '{e.node_id}' ({e.node_type}) failed: {e.error_message}",
+                },
+            )
+
+        except Exception as e:
+            duration_ms = int((time.perf_counter() - start_time) * 1000)
+            error_type = type(e).__name__
+            error_msg = str(e)[:MAX_ERROR_MESSAGE_LENGTH]
+
+            is_recursion_error = "recursion" in error_type.lower() or (
+                "recursion" in error_msg.lower()
+            )
+
+            if is_recursion_error:
+                error_code = "RECURSION_LIMIT"
+                error_message = (
+                    f"Execution exceeded recursion_limit of {config.max_steps} steps"
+                )
+            else:
+                error_code = error_type
+                error_message = error_msg
+
+            yield WorkflowEvent(
+                event_type="workflow_error",
+                data={
+                    "error_code": error_code,
+                    "error_message": error_message,
+                },
+            )
 
     def _extract_steps(self, result: Dict[str, Any]) -> List[StepResult]:
         """Extract StepResult list from graph execution result.
