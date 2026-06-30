@@ -12,33 +12,40 @@ import { AgentMemoryService } from '../../agent-memory/services/agent-memory.ser
 import { ObservabilityService } from '../../observability/services/observability.service';
 import { ModelRegistryService } from '../../model-registry/services/model-registry.service';
 
+import { LangGraphClientService } from './langgraph-client.service';
+import { CircuitBreakerService } from './circuit-breaker.service';
+import { FallbackHandlerService } from './fallback-handler.service';
+
 import {
   AgentExecutionRequest,
   AgentExecutionResult,
   IAgentExecutionService,
 } from '../interfaces/agent-execution.interface';
 
+import {
+  ExecuteWorkflowRequest,
+  ExecuteWorkflowResponse,
+} from '../interfaces/grpc-types';
+
 /**
- * AgentExecutionService orchestrates the full agent execution pipeline:
+ * AgentExecutionService orchestrates agent execution by delegating to the
+ * LangGraph Python service via gRPC. Uses circuit breaker pattern for resilience
+ * and falls back to a simplified local pipeline when LangGraph is unavailable.
  *
+ * Pipeline:
  * 1. Load agent config (AgentConfigService)
  * 2. Resolve prompt from PromptRegistry (with template variables from tenant context)
  * 3. Validate input content via Guardrails (pre-generation)
- * 4. Execute via Model Registry (select model, handle fallback if primary unavailable)
- * 5. Validate output content via Guardrails (post-generation)
- * 6. If guardrail violation → regenerate (up to max retries) or block
- * 7. Persist interaction to Agent Memory (short-term)
- * 8. Log execution to Observability (with trace_id, tokens, duration, status)
- * 9. Track token usage via Model Registry
+ * 4. Delegate execution to LangGraph via gRPC (with circuit breaker + fallback)
+ * 5. Persist interaction to Agent Memory (short-term)
+ * 6. Log execution to Observability (with trace_id, tokens, duration, status)
+ * 7. Track token usage via Model Registry
  *
- * Requirements: 5.4, 9.7, 10.6, 11.3, 13.1, 13.9
+ * Requirements: 1.1, 2.2
  */
 @Injectable()
 export class AgentExecutionService implements IAgentExecutionService {
   private readonly logger = new Logger(AgentExecutionService.name);
-
-  /** Maximum number of regeneration attempts when guardrails are violated. */
-  private readonly MAX_REGENERATION_ATTEMPTS = 3;
 
   constructor(
     private readonly agentConfigService: AgentConfigService,
@@ -47,10 +54,14 @@ export class AgentExecutionService implements IAgentExecutionService {
     private readonly agentMemoryService: AgentMemoryService,
     private readonly observabilityService: ObservabilityService,
     private readonly modelRegistryService: ModelRegistryService,
+    private readonly langGraphClient: LangGraphClientService,
+    private readonly circuitBreaker: CircuitBreakerService,
+    private readonly fallbackHandler: FallbackHandlerService,
   ) {}
 
   /**
    * Execute the full agent pipeline end-to-end.
+   * Delegates to LangGraph via gRPC with circuit breaker protection.
    */
   async execute(request: AgentExecutionRequest): Promise<AgentExecutionResult> {
     const startTime = Date.now();
@@ -114,115 +125,77 @@ export class AgentExecutionService implements IAgentExecutionService {
       }
 
       // =====================================================================
-      // STEP 4: Select model (primary + fallback routing)
+      // STEP 4: Delegate to LangGraph via gRPC (circuit breaker + fallback)
       // =====================================================================
-      const { modelId, usedFallback } = await this.selectModel(
-        agentConfig.modelId,
-        agentConfig.fallbackModelId,
+      const grpcRequest = this.buildGrpcRequest(request, resolvedPrompt);
+
+      const grpcResponse = await this.circuitBreaker.execute<ExecuteWorkflowResponse>(
+        () => this.langGraphClient.executeWorkflow(grpcRequest),
+        () => this.fallbackHandler.executeFallback(grpcRequest),
       );
 
       // =====================================================================
-      // STEP 5 + 6: Generate output and validate via post-generation guardrails
-      //             Regenerate on violation (up to max retries)
+      // STEP 5: Map gRPC response to AgentExecutionResult
       // =====================================================================
-      let generatedOutput = '';
-      let finalTokens = { inputTokens: 0, outputTokens: 0 };
-      let blocked = false;
-      let blockedReason: string | undefined;
+      const usedFallback = grpcResponse.usedFallback;
+      const modelId = grpcResponse.modelId || agentConfig.modelId || '';
+      const output = grpcResponse.output;
+      const tokensUsed = {
+        inputTokens: grpcResponse.tokensUsed?.inputTokens ?? 0,
+        outputTokens: grpcResponse.tokensUsed?.outputTokens ?? 0,
+      };
 
-      for (let attempt = 1; attempt <= this.MAX_REGENERATION_ATTEMPTS; attempt++) {
-        // Simulate LLM generation (in production, this calls the actual model API)
-        const generationResult = await this.generateContent(
-          modelId,
-          resolvedPrompt,
-          request.userInput,
-          request.tenantId,
-          request.agentId,
-        );
-
-        generatedOutput = generationResult.output;
-        finalTokens = {
-          inputTokens: finalTokens.inputTokens + generationResult.inputTokens,
-          outputTokens: finalTokens.outputTokens + generationResult.outputTokens,
-        };
-
-        // Post-generation guardrail validation
-        const postValidation = await this.guardrailsService.validateWithRegeneration(
-          generatedOutput,
-          request.tenantId,
-          request.agentId,
-          attempt,
-        );
-
-        if (postValidation.success) {
-          // Content is valid — exit the loop
-          break;
-        }
-
-        // Track violation names
-        const violationNames = postValidation.violations.map((v) => v.guardrailName);
-        guardrailViolations.push(...violationNames);
-
-        if (postValidation.blocked) {
-          blocked = true;
-          blockedReason =
-            'Generated content blocked after maximum regeneration attempts';
-          generatedOutput = '';
-          break;
-        }
-
-        // Otherwise, loop and regenerate
-        this.logger.warn(
-          `[${traceId}] Guardrail violation on attempt ${attempt}, regenerating...`,
-        );
+      // Collect guardrail violations from response
+      if (grpcResponse.guardrailViolations?.length > 0) {
+        guardrailViolations.push(...grpcResponse.guardrailViolations);
       }
 
       // =====================================================================
-      // STEP 7: Persist interaction to Agent Memory (short-term)
+      // STEP 6: Persist interaction to Agent Memory (short-term)
       // =====================================================================
       await this.persistToMemory(
         request.agentId,
         request.tenantId,
         request.userInput,
-        generatedOutput,
+        output,
       );
 
       // =====================================================================
-      // STEP 8: Log execution to Observability
+      // STEP 7: Log execution to Observability
       // =====================================================================
       const durationMs = Date.now() - startTime;
-      const status = blocked ? 'error' : 'success';
+      const status = grpcResponse.success ? 'success' : 'error';
 
       await this.logExecution(
         traceId,
         request,
-        generatedOutput,
+        output,
         durationMs,
         status,
-        finalTokens,
+        tokensUsed,
         guardrailViolations,
         modelId,
       );
 
       // =====================================================================
-      // STEP 9: Track token usage via Model Registry
+      // STEP 8: Track token usage via Model Registry
       // =====================================================================
       await this.modelRegistryService.trackUsage(request.tenantId, modelId, {
-        inputTokens: finalTokens.inputTokens,
-        outputTokens: finalTokens.outputTokens,
+        inputTokens: tokensUsed.inputTokens,
+        outputTokens: tokensUsed.outputTokens,
         agentId: request.agentId,
         timestamp: new Date(),
       });
 
       return {
-        success: !blocked,
-        output: generatedOutput,
+        success: grpcResponse.success,
+        output,
         traceId,
         modelId,
         usedFallback,
-        tokensUsed: finalTokens,
+        tokensUsed,
         durationMs,
-        blockedReason,
+        blockedReason: grpcResponse.blockedReason || undefined,
         guardrailViolations:
           guardrailViolations.length > 0 ? guardrailViolations : undefined,
       };
@@ -262,8 +235,6 @@ export class AgentExecutionService implements IAgentExecutionService {
     const agent = agents.find((a) => a.id === agentId);
 
     if (!agent) {
-      // Try fetching all agents (the list method filters by tenant;
-      // we need a different approach — use the repository directly via the config history)
       throw new NotFoundException(`Agent config not found: ${agentId}`);
     }
 
@@ -296,74 +267,31 @@ export class AgentExecutionService implements IAgentExecutionService {
   }
 
   /**
-   * Step 4: Select model with fallback routing.
-   * Checks primary availability; if unavailable, routes to fallback.
+   * Build the gRPC ExecuteWorkflowRequest from the incoming AgentExecutionRequest.
    */
-  private async selectModel(
-    primaryModelId: string | null,
-    fallbackModelId: string | null | undefined,
-  ): Promise<{ modelId: string; usedFallback: boolean }> {
-    if (!primaryModelId) {
-      throw new ServiceUnavailableException(
-        'No model configured for this agent',
-      );
-    }
-
-    // Check primary model availability
-    const health = await this.modelRegistryService.checkAvailability(primaryModelId);
-
-    if (health.isAvailable) {
-      return { modelId: primaryModelId, usedFallback: false };
-    }
-
-    // Primary unavailable — try configured fallback
-    this.logger.warn(
-      `Primary model ${primaryModelId} unavailable, attempting fallback...`,
-    );
-
-    if (fallbackModelId) {
-      const fallbackHealth =
-        await this.modelRegistryService.checkAvailability(fallbackModelId);
-      if (fallbackHealth.isAvailable) {
-        return { modelId: fallbackModelId, usedFallback: true };
-      }
-    }
-
-    // Try automatic fallback from Model Registry
-    const autoFallback =
-      await this.modelRegistryService.getFallback(primaryModelId);
-    if (autoFallback) {
-      return { modelId: autoFallback.id, usedFallback: true };
-    }
-
-    throw new ServiceUnavailableException(
-      'No available model (primary or fallback) for this agent',
-    );
-  }
-
-  /**
-   * Step 5: Generate content via model.
-   * In production, this would call the actual LLM provider API.
-   * For the MVP foundation, this is a stub that returns a placeholder.
-   */
-  private async generateContent(
-    _modelId: string,
-    _systemPrompt: string,
-    _userInput: string,
-    _tenantId: string,
-    _agentId: string,
-  ): Promise<{ output: string; inputTokens: number; outputTokens: number }> {
-    // Stub: In production, this calls the LLM API via the model's provider.
-    // The actual integration will be implemented in the AI Orchestration layer (LangGraph).
+  private buildGrpcRequest(
+    request: AgentExecutionRequest,
+    _resolvedPrompt: string,
+  ): ExecuteWorkflowRequest {
     return {
-      output: `Generated response for input`,
-      inputTokens: 150,
-      outputTokens: 100,
+      agentId: request.agentId,
+      tenantId: request.tenantId,
+      userInput: request.userInput,
+      userId: request.userId || '',
+      tenantContext: request.tenantContext || {},
+      workflowId: '',
+      conversationId: '',
+      options: {
+        maxSteps: 50,
+        timeoutMs: 120_000,
+        enableStreaming: false,
+        metadata: {},
+      },
     };
   }
 
   /**
-   * Step 7: Persist both user input and assistant output to short-term memory.
+   * Persist both user input and assistant output to short-term memory.
    */
   private async persistToMemory(
     agentId: string,
@@ -393,7 +321,7 @@ export class AgentExecutionService implements IAgentExecutionService {
   }
 
   /**
-   * Step 8: Log execution to Observability with trace_id.
+   * Log execution to Observability with trace_id.
    */
   private async logExecution(
     traceId: string,

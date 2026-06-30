@@ -11,6 +11,7 @@ from typing import Any, Optional, Protocol
 import redis.asyncio as redis
 
 from .exceptions import PersistenceError, RedisUnavailableError, StateManagerError
+from .tenant_context import tenant_connection
 
 logger = logging.getLogger(__name__)
 
@@ -394,6 +395,9 @@ class RedisStateManager:
     ) -> None:
         """Grava o estado final na tabela workflow_executions.
 
+        Uses the tenant_connection context manager to ensure RLS policies
+        are enforced via SET LOCAL app.current_tenant within a transaction.
+
         Args:
             execution_id: ID da execução.
             tenant_id: ID do tenant.
@@ -405,13 +409,7 @@ class RedisStateManager:
         if self._pg_pool is None:
             raise RuntimeError("PostgreSQL pool not configured")
 
-        async with self._pg_pool.acquire() as conn:
-            # Set RLS session variable for tenant isolation
-            await conn.execute(
-                "SELECT set_config('app.current_tenant', $1, true)",
-                tenant_id,
-            )
-
+        async with tenant_connection(self._pg_pool, tenant_id) as conn:
             await conn.execute(
                 """
                 INSERT INTO workflow_executions (

@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  Inject,
   Injectable,
   Logger,
   NotFoundException,
@@ -16,6 +17,9 @@ import {
   ResolvedPrompt,
   SandboxResult,
 } from '../interfaces/prompt-registry-service.interface';
+import { ICacheService } from '../../cache/interfaces/cache-service.interface';
+import { CacheKeyBuilder } from '../../cache/services/cache-key-builder.service';
+import { CACHE_SERVICE, PROMPTS_TTL } from '../../cache/config/cache.constants';
 
 /**
  * Regex pattern for detecting template variables like {{variable_name}}.
@@ -36,6 +40,8 @@ export class PromptRegistryService implements IPromptRegistryService {
     private readonly promptRepository: Repository<Prompt>,
     @InjectRepository(PromptVersion)
     private readonly versionRepository: Repository<PromptVersion>,
+    @Inject(CACHE_SERVICE) private readonly cache: ICacheService,
+    private readonly keyBuilder: CacheKeyBuilder,
   ) {}
 
   /**
@@ -126,14 +132,29 @@ export class PromptRegistryService implements IPromptRegistryService {
     prompt.activeVersion = dto.version;
     await this.promptRepository.save(prompt);
 
+    // Invalidate distributed cache so updated prompt applies immediately
+    await this.cache.delete(
+      this.keyBuilder.globalKey('prompts', `${promptId}:active`),
+    );
+
     this.logger.log(`Updated prompt ${promptId} to v${dto.version}`);
     return savedVersion;
   }
 
   /**
    * Get the active version of a prompt with its raw content (no variable substitution).
+   * Implements cache-aside pattern: check cache → on miss, query DB and populate cache.
    */
   async getActive(promptId: string): Promise<ResolvedPrompt> {
+    const cacheKey = this.keyBuilder.globalKey('prompts', `${promptId}:active`);
+
+    // Try cache first
+    const cached = await this.cache.get<ResolvedPrompt>(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    // Cache miss — fetch from DB
     const prompt = await this.findPromptOrFail(promptId);
 
     const activeVersion = await this.versionRepository.findOne({
@@ -146,12 +167,17 @@ export class PromptRegistryService implements IPromptRegistryService {
       );
     }
 
-    return {
+    const result: ResolvedPrompt = {
       content: activeVersion.content,
       version: activeVersion.version,
       resolvedVariables: {},
       unresolvedVariables: activeVersion.variables,
     };
+
+    // Cache the template (with unresolved variables)
+    await this.cache.set(cacheKey, result, PROMPTS_TTL);
+
+    return result;
   }
 
   /**
@@ -184,6 +210,11 @@ export class PromptRegistryService implements IPromptRegistryService {
     // Update prompt active version reference
     prompt.activeVersion = version;
     await this.promptRepository.save(prompt);
+
+    // Invalidate distributed cache so rolled-back prompt applies immediately
+    await this.cache.delete(
+      this.keyBuilder.globalKey('prompts', `${promptId}:active`),
+    );
 
     this.logger.log(`Rolled back prompt ${promptId} to v${version}`);
   }

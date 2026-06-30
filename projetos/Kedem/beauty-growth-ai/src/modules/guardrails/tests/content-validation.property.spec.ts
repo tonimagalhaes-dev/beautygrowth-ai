@@ -205,12 +205,35 @@ describe('Property 20: Guardrails — Validação de Conteúdo', () => {
 
     const eventEmitter = { emit: jest.fn() };
 
+    // Mock cache service for distributed cache
+    const mockCacheService = {
+      get: jest.fn().mockResolvedValue(null),
+      set: jest.fn().mockResolvedValue(undefined),
+      delete: jest.fn().mockResolvedValue(undefined),
+      deleteByPattern: jest.fn().mockResolvedValue(0),
+      exists: jest.fn().mockResolvedValue(false),
+      getMetrics: jest.fn(),
+      getHealth: jest.fn(),
+    };
+
+    const mockKeyBuilder = {
+      tenantKey: jest.fn((tenantId: string, resource: string, identifier: string) =>
+        `beautygrowth:cache:tenant:${tenantId}:${resource}:${identifier}`),
+      globalKey: jest.fn((resource: string, identifier: string) =>
+        `beautygrowth:cache:global:${resource}:${identifier}`),
+      tenantPattern: jest.fn(),
+      tenantResourcePattern: jest.fn(),
+      validateTenantId: jest.fn(),
+    };
+
     // Directly instantiate the service to avoid cache sharing
     const service = new GuardrailsService(
       guardrailRepo as any,
       violationRepo as any,
       versionRepo as any,
       eventEmitter as any,
+      mockCacheService as any,
+      mockKeyBuilder as any,
     );
 
     return service;

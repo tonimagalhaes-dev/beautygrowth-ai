@@ -7,7 +7,7 @@ import json
 import sys
 from pathlib import Path
 from typing import Optional
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -707,6 +707,11 @@ class FakePgPool:
 
     def __init__(self, mock_conn):
         self._mock_conn = mock_conn
+        # Ensure conn.transaction() returns an async context manager
+        # (tenant_connection wraps queries in a transaction)
+        mock_conn.transaction = MagicMock(
+            return_value=FakeAsyncContextManager(None)
+        )
 
     def acquire(self):
         return FakeAsyncContextManager(self._mock_conn)

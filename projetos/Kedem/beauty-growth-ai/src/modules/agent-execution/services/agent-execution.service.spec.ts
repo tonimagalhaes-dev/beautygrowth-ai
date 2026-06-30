@@ -2,6 +2,9 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { NotFoundException, ServiceUnavailableException } from '@nestjs/common';
 
 import { AgentExecutionService } from './agent-execution.service';
+import { LangGraphClientService } from './langgraph-client.service';
+import { CircuitBreakerService } from './circuit-breaker.service';
+import { FallbackHandlerService } from './fallback-handler.service';
 import { AgentConfigService } from '../../agent-config/services/agent-config.service';
 import { PromptRegistryService } from '../../prompt-registry/services/prompt-registry.service';
 import { GuardrailsService } from '../../guardrails/services/guardrails.service';
@@ -9,6 +12,7 @@ import { AgentMemoryService } from '../../agent-memory/services/agent-memory.ser
 import { ObservabilityService } from '../../observability/services/observability.service';
 import { ModelRegistryService } from '../../model-registry/services/model-registry.service';
 import { AgentExecutionRequest } from '../interfaces/agent-execution.interface';
+import { ExecuteWorkflowResponse, ExecutionStatus } from '../interfaces/grpc-types';
 
 describe('AgentExecutionService', () => {
   let service: AgentExecutionService;
@@ -18,6 +22,9 @@ describe('AgentExecutionService', () => {
   let agentMemoryService: jest.Mocked<AgentMemoryService>;
   let observabilityService: jest.Mocked<ObservabilityService>;
   let modelRegistryService: jest.Mocked<ModelRegistryService>;
+  let langGraphClient: jest.Mocked<LangGraphClientService>;
+  let circuitBreaker: jest.Mocked<CircuitBreakerService>;
+  let fallbackHandler: jest.Mocked<FallbackHandlerService>;
 
   const mockAgentConfig = {
     id: 'agent-1',
@@ -48,6 +55,30 @@ describe('AgentExecutionService', () => {
     userInput: 'Create a social media post about skincare',
     userId: 'user-1',
     tenantContext: { nome_clinica: 'Test Clinic' },
+  };
+
+  const mockGrpcResponse: ExecuteWorkflowResponse = {
+    success: true,
+    output: 'Generated content from LangGraph',
+    traceId: 'grpc-trace-123',
+    modelId: 'model-1',
+    usedFallback: false,
+    tokensUsed: { inputTokens: 150, outputTokens: 100 },
+    durationMs: 500,
+    blockedReason: '',
+    guardrailViolations: [],
+    finalState: {
+      executionId: 'exec-1',
+      workflowId: 'wf-1',
+      tenantId: 'tenant-1',
+      status: ExecutionStatus.EXECUTION_STATUS_COMPLETED,
+      stateData: {},
+      currentNode: '',
+      completedNodes: [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    },
+    steps: [],
   };
 
   beforeEach(async () => {
@@ -94,6 +125,26 @@ describe('AgentExecutionService', () => {
             trackUsage: jest.fn(),
           },
         },
+        {
+          provide: LangGraphClientService,
+          useValue: {
+            executeWorkflow: jest.fn(),
+          },
+        },
+        {
+          provide: CircuitBreakerService,
+          useValue: {
+            execute: jest.fn(),
+            getState: jest.fn(),
+            reset: jest.fn(),
+          },
+        },
+        {
+          provide: FallbackHandlerService,
+          useValue: {
+            executeFallback: jest.fn(),
+          },
+        },
       ],
     }).compile();
 
@@ -104,13 +155,16 @@ describe('AgentExecutionService', () => {
     agentMemoryService = module.get(AgentMemoryService);
     observabilityService = module.get(ObservabilityService);
     modelRegistryService = module.get(ModelRegistryService);
+    langGraphClient = module.get(LangGraphClientService);
+    circuitBreaker = module.get(CircuitBreakerService);
+    fallbackHandler = module.get(FallbackHandlerService);
   });
 
   // =========================================================================
-  // HAPPY PATH: Full pipeline execution
+  // HAPPY PATH: Full pipeline execution via LangGraph gRPC
   // =========================================================================
 
-  describe('execute - happy path', () => {
+  describe('execute - happy path (LangGraph delegation)', () => {
     beforeEach(() => {
       observabilityService.generateTraceId.mockReturnValue('trace-test-123');
       agentConfigService.list.mockResolvedValue([mockAgentConfig as any]);
@@ -122,96 +176,47 @@ describe('AgentExecutionService', () => {
         blocked: false,
         violations: [],
       });
-      modelRegistryService.checkAvailability.mockResolvedValue({
-        modelId: 'model-1',
-        isAvailable: true,
-        lastCheckedAt: new Date(),
-      });
+      // Circuit breaker delegates to the primary fn (LangGraph client)
+      circuitBreaker.execute.mockImplementation(async (fn) => fn());
+      langGraphClient.executeWorkflow.mockResolvedValue(mockGrpcResponse);
       modelRegistryService.trackUsage.mockResolvedValue(undefined);
       agentMemoryService.persistInteraction.mockResolvedValue(undefined);
       observabilityService.logAgentAction.mockResolvedValue(undefined);
     });
 
-    it('should execute the full pipeline in order and return success', async () => {
-      const callOrder: string[] = [];
-
-      agentConfigService.list.mockImplementation(async () => {
-        callOrder.push('1-loadConfig');
-        return [mockAgentConfig as any];
-      });
-
-      promptRegistryService.resolve.mockImplementation(async () => {
-        callOrder.push('2-resolvePrompt');
-        return mockResolvedPrompt;
-      });
-
-      guardrailsService.validateWithRegeneration.mockImplementation(
-        async (_content, _tenantId, _agentId, _attempt) => {
-          if (callOrder[callOrder.length - 1] === '2-resolvePrompt') {
-            callOrder.push('3-preGuardrails');
-          } else {
-            callOrder.push('5-postGuardrails');
-          }
-          return {
-            success: true,
-            attempt: 1,
-            maxRetries: 3,
-            blocked: false,
-            violations: [],
-          };
-        },
-      );
-
-      modelRegistryService.checkAvailability.mockImplementation(async () => {
-        callOrder.push('4-selectModel');
-        return { modelId: 'model-1', isAvailable: true, lastCheckedAt: new Date() };
-      });
-
-      agentMemoryService.persistInteraction.mockImplementation(async () => {
-        callOrder.push('7-persistMemory');
-      });
-
-      observabilityService.logAgentAction.mockImplementation(async () => {
-        callOrder.push('8-logObservability');
-      });
-
-      modelRegistryService.trackUsage.mockImplementation(async () => {
-        callOrder.push('9-trackTokens');
-      });
-
+    it('should execute via LangGraph gRPC and return success', async () => {
       const result = await service.execute(mockRequest);
 
-      // Verify successful result
       expect(result.success).toBe(true);
       expect(result.traceId).toBe('trace-test-123');
       expect(result.modelId).toBe('model-1');
       expect(result.usedFallback).toBe(false);
-      expect(result.output).toBeTruthy();
-      expect(result.tokensUsed.inputTokens).toBeGreaterThan(0);
-      expect(result.tokensUsed.outputTokens).toBeGreaterThan(0);
+      expect(result.output).toBe('Generated content from LangGraph');
+      expect(result.tokensUsed.inputTokens).toBe(150);
+      expect(result.tokensUsed.outputTokens).toBe(100);
       expect(result.durationMs).toBeGreaterThanOrEqual(0);
+    });
 
-      // Verify pipeline order
-      expect(callOrder).toContain('1-loadConfig');
-      expect(callOrder).toContain('2-resolvePrompt');
-      expect(callOrder).toContain('3-preGuardrails');
-      expect(callOrder).toContain('4-selectModel');
-      expect(callOrder).toContain('5-postGuardrails');
-      expect(callOrder).toContain('7-persistMemory');
-      expect(callOrder).toContain('8-logObservability');
-      expect(callOrder).toContain('9-trackTokens');
+    it('should call circuit breaker with LangGraph client as primary function', async () => {
+      await service.execute(mockRequest);
 
-      // Verify order is correct
-      const configIdx = callOrder.indexOf('1-loadConfig');
-      const promptIdx = callOrder.indexOf('2-resolvePrompt');
-      const preGuardrailIdx = callOrder.indexOf('3-preGuardrails');
-      const modelIdx = callOrder.indexOf('4-selectModel');
-      const postGuardrailIdx = callOrder.indexOf('5-postGuardrails');
+      expect(circuitBreaker.execute).toHaveBeenCalledWith(
+        expect.any(Function),
+        expect.any(Function),
+      );
+    });
 
-      expect(configIdx).toBeLessThan(promptIdx);
-      expect(promptIdx).toBeLessThan(preGuardrailIdx);
-      expect(preGuardrailIdx).toBeLessThan(modelIdx);
-      expect(modelIdx).toBeLessThan(postGuardrailIdx);
+    it('should pass correct gRPC request to LangGraph client', async () => {
+      await service.execute(mockRequest);
+
+      expect(langGraphClient.executeWorkflow).toHaveBeenCalledWith(
+        expect.objectContaining({
+          agentId: 'agent-1',
+          tenantId: 'tenant-1',
+          userInput: 'Create a social media post about skincare',
+          userId: 'user-1',
+        }),
+      );
     });
 
     it('should generate a trace_id for end-to-end correlation', async () => {
@@ -251,7 +256,7 @@ describe('AgentExecutionService', () => {
         expect.objectContaining({
           tenantId: 'tenant-1',
           role: 'assistant',
-          content: expect.any(String),
+          content: 'Generated content from LangGraph',
         }),
       );
     });
@@ -269,8 +274,8 @@ describe('AgentExecutionService', () => {
           status: 'success',
           durationMs: expect.any(Number),
           tokensUsed: expect.objectContaining({
-            inputTokens: expect.any(Number),
-            outputTokens: expect.any(Number),
+            inputTokens: 150,
+            outputTokens: 100,
           }),
         }),
       );
@@ -283,8 +288,8 @@ describe('AgentExecutionService', () => {
         'tenant-1',
         'model-1',
         expect.objectContaining({
-          inputTokens: expect.any(Number),
-          outputTokens: expect.any(Number),
+          inputTokens: 150,
+          outputTokens: 100,
           agentId: 'agent-1',
           timestamp: expect.any(Date),
         }),
@@ -293,12 +298,36 @@ describe('AgentExecutionService', () => {
   });
 
   // =========================================================================
-  // MODEL FALLBACK
+  // CIRCUIT BREAKER FALLBACK
   // =========================================================================
 
-  describe('execute - model fallback routing', () => {
+  describe('execute - circuit breaker fallback', () => {
+    const mockFallbackResponse: ExecuteWorkflowResponse = {
+      success: true,
+      output: '[Fallback Mode] Response',
+      traceId: 'fallback-trace',
+      modelId: 'fallback-direct',
+      usedFallback: true,
+      tokensUsed: { inputTokens: 0, outputTokens: 0 },
+      durationMs: 50,
+      blockedReason: '',
+      guardrailViolations: [],
+      finalState: {
+        executionId: 'fb-1',
+        workflowId: '',
+        tenantId: 'tenant-1',
+        status: ExecutionStatus.EXECUTION_STATUS_COMPLETED,
+        stateData: {},
+        currentNode: '',
+        completedNodes: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      },
+      steps: [],
+    };
+
     beforeEach(() => {
-      observabilityService.generateTraceId.mockReturnValue('trace-test-fallback');
+      observabilityService.generateTraceId.mockReturnValue('trace-fallback');
       agentConfigService.list.mockResolvedValue([mockAgentConfig as any]);
       promptRegistryService.resolve.mockResolvedValue(mockResolvedPrompt);
       guardrailsService.validateWithRegeneration.mockResolvedValue({
@@ -313,69 +342,35 @@ describe('AgentExecutionService', () => {
       modelRegistryService.trackUsage.mockResolvedValue(undefined);
     });
 
-    it('should use fallback model when primary is unavailable', async () => {
-      modelRegistryService.checkAvailability
-        .mockResolvedValueOnce({
-          modelId: 'model-1',
-          isAvailable: false,
-          lastCheckedAt: new Date(),
-          errorMessage: 'Model unavailable',
-        })
-        .mockResolvedValueOnce({
-          modelId: 'model-2',
-          isAvailable: true,
-          lastCheckedAt: new Date(),
-        });
+    it('should use fallback when circuit breaker is OPEN', async () => {
+      // Circuit breaker calls the fallback function
+      circuitBreaker.execute.mockImplementation(async (_fn, fallback) => fallback());
+      fallbackHandler.executeFallback.mockResolvedValue(mockFallbackResponse);
 
       const result = await service.execute(mockRequest);
 
       expect(result.success).toBe(true);
       expect(result.usedFallback).toBe(true);
-      expect(result.modelId).toBe('model-2');
+      expect(result.output).toBe('[Fallback Mode] Response');
+      expect(result.modelId).toBe('fallback-direct');
     });
 
-    it('should use automatic fallback from ModelRegistry when both configured models are down', async () => {
-      modelRegistryService.checkAvailability.mockResolvedValue({
-        modelId: 'model-1',
-        isAvailable: false,
-        lastCheckedAt: new Date(),
-        errorMessage: 'Unavailable',
+    it('should use fallback when LangGraph client fails and circuit opens', async () => {
+      // Circuit breaker tries fn, fails, then calls fallback
+      circuitBreaker.execute.mockImplementation(async (fn, fallback) => {
+        try {
+          return await fn();
+        } catch {
+          return fallback();
+        }
       });
-
-      modelRegistryService.getFallback.mockResolvedValue({
-        id: 'model-auto-fallback',
-        provider: 'anthropic',
-        name: 'claude-3',
-        version: '1.0',
-        capabilities: ['text_generation'],
-        costPerInputToken: 0.001,
-        costPerOutputToken: 0.002,
-        contextWindow: 100000,
-        status: 'available',
-        maxTemperature: 2.0,
-        maxOutputTokens: 4096,
-      } as any);
+      langGraphClient.executeWorkflow.mockRejectedValue(new Error('UNAVAILABLE'));
+      fallbackHandler.executeFallback.mockResolvedValue(mockFallbackResponse);
 
       const result = await service.execute(mockRequest);
 
       expect(result.success).toBe(true);
       expect(result.usedFallback).toBe(true);
-      expect(result.modelId).toBe('model-auto-fallback');
-    });
-
-    it('should throw ServiceUnavailableException when no model is available', async () => {
-      modelRegistryService.checkAvailability.mockResolvedValue({
-        modelId: 'model-1',
-        isAvailable: false,
-        lastCheckedAt: new Date(),
-        errorMessage: 'Unavailable',
-      });
-
-      modelRegistryService.getFallback.mockResolvedValue(null);
-
-      await expect(service.execute(mockRequest)).rejects.toThrow(
-        ServiceUnavailableException,
-      );
     });
   });
 
@@ -414,138 +409,50 @@ describe('AgentExecutionService', () => {
       expect(result.success).toBe(false);
       expect(result.blockedReason).toBe('Input content blocked by guardrails');
       expect(result.guardrailViolations).toContain('no_medical_diagnosis');
-      // Should NOT call model or persist memory for blocked input
-      expect(modelRegistryService.checkAvailability).not.toHaveBeenCalled();
+      // Should NOT call LangGraph or circuit breaker for blocked input
+      expect(circuitBreaker.execute).not.toHaveBeenCalled();
     });
   });
 
   // =========================================================================
-  // GUARDRAILS - POST-GENERATION WITH REGENERATION
+  // GRPC RESPONSE WITH GUARDRAIL VIOLATIONS
   // =========================================================================
 
-  describe('execute - post-generation guardrails with regeneration', () => {
+  describe('execute - gRPC response with guardrail violations', () => {
     beforeEach(() => {
-      observabilityService.generateTraceId.mockReturnValue('trace-post-guard');
+      observabilityService.generateTraceId.mockReturnValue('trace-grpc-guard');
       agentConfigService.list.mockResolvedValue([mockAgentConfig as any]);
       promptRegistryService.resolve.mockResolvedValue(mockResolvedPrompt);
-      modelRegistryService.checkAvailability.mockResolvedValue({
-        modelId: 'model-1',
-        isAvailable: true,
-        lastCheckedAt: new Date(),
+      guardrailsService.validateWithRegeneration.mockResolvedValue({
+        success: true,
+        attempt: 1,
+        maxRetries: 3,
+        blocked: false,
+        violations: [],
       });
       agentMemoryService.persistInteraction.mockResolvedValue(undefined);
       observabilityService.logAgentAction.mockResolvedValue(undefined);
       modelRegistryService.trackUsage.mockResolvedValue(undefined);
     });
 
-    it('should regenerate when output violates guardrails then succeeds', async () => {
-      // Pre-generation passes
-      guardrailsService.validateWithRegeneration
-        .mockResolvedValueOnce({
-          success: true,
-          attempt: 1,
-          maxRetries: 3,
-          blocked: false,
-          violations: [],
-        })
-        // Post-generation attempt 1: fails
-        .mockResolvedValueOnce({
-          success: false,
-          attempt: 1,
-          maxRetries: 3,
-          blocked: false,
-          violations: [
-            {
-              guardrailId: 'g-1',
-              guardrailName: 'no_health_promises',
-              severity: 'high',
-              description: 'Promises health results',
-              matchedContent: 'guaranteed results',
-            },
-          ],
-        })
-        // Post-generation attempt 2: passes
-        .mockResolvedValueOnce({
-          success: true,
-          attempt: 2,
-          maxRetries: 3,
-          blocked: false,
-          violations: [],
-        });
+    it('should propagate guardrail violations from gRPC response', async () => {
+      const responseWithViolations: ExecuteWorkflowResponse = {
+        ...mockGrpcResponse,
+        success: false,
+        output: '',
+        blockedReason: 'Guardrail violation in workflow',
+        guardrailViolations: ['no_health_promises', 'no_medical_diagnosis'],
+      };
 
-      const result = await service.execute(mockRequest);
-
-      expect(result.success).toBe(true);
-      expect(result.guardrailViolations).toContain('no_health_promises');
-      // Tokens should accumulate from both attempts
-      expect(result.tokensUsed.inputTokens).toBe(300); // 150 * 2
-      expect(result.tokensUsed.outputTokens).toBe(200); // 100 * 2
-    });
-
-    it('should block after max regeneration attempts', async () => {
-      // Pre-generation passes
-      guardrailsService.validateWithRegeneration
-        .mockResolvedValueOnce({
-          success: true,
-          attempt: 1,
-          maxRetries: 3,
-          blocked: false,
-          violations: [],
-        })
-        // Post-gen attempt 1: fails
-        .mockResolvedValueOnce({
-          success: false,
-          attempt: 1,
-          maxRetries: 3,
-          blocked: false,
-          violations: [
-            {
-              guardrailId: 'g-1',
-              guardrailName: 'no_health_promises',
-              severity: 'critical',
-              description: 'test',
-              matchedContent: 'test',
-            },
-          ],
-        })
-        // Post-gen attempt 2: fails
-        .mockResolvedValueOnce({
-          success: false,
-          attempt: 2,
-          maxRetries: 3,
-          blocked: false,
-          violations: [
-            {
-              guardrailId: 'g-1',
-              guardrailName: 'no_health_promises',
-              severity: 'critical',
-              description: 'test',
-              matchedContent: 'test',
-            },
-          ],
-        })
-        // Post-gen attempt 3: blocked
-        .mockResolvedValueOnce({
-          success: false,
-          attempt: 3,
-          maxRetries: 3,
-          blocked: true,
-          violations: [
-            {
-              guardrailId: 'g-1',
-              guardrailName: 'no_health_promises',
-              severity: 'critical',
-              description: 'test',
-              matchedContent: 'test',
-            },
-          ],
-        });
+      circuitBreaker.execute.mockImplementation(async (fn) => fn());
+      langGraphClient.executeWorkflow.mockResolvedValue(responseWithViolations);
 
       const result = await service.execute(mockRequest);
 
       expect(result.success).toBe(false);
-      expect(result.blockedReason).toContain('maximum regeneration attempts');
-      expect(result.output).toBe('');
+      expect(result.blockedReason).toBe('Guardrail violation in workflow');
+      expect(result.guardrailViolations).toContain('no_health_promises');
+      expect(result.guardrailViolations).toContain('no_medical_diagnosis');
     });
   });
 
@@ -587,11 +494,8 @@ describe('AgentExecutionService', () => {
         blocked: false,
         violations: [],
       });
-      modelRegistryService.checkAvailability.mockResolvedValue({
-        modelId: 'model-1',
-        isAvailable: true,
-        lastCheckedAt: new Date(),
-      });
+      circuitBreaker.execute.mockImplementation(async (fn) => fn());
+      langGraphClient.executeWorkflow.mockResolvedValue(mockGrpcResponse);
       agentMemoryService.persistInteraction.mockResolvedValue(undefined);
       modelRegistryService.trackUsage.mockResolvedValue(undefined);
 
@@ -615,6 +519,21 @@ describe('AgentExecutionService', () => {
           agentId: 'agent-1',
         }),
       );
+    });
+
+    it('should propagate error when circuit breaker throws', async () => {
+      agentConfigService.list.mockResolvedValue([mockAgentConfig as any]);
+      promptRegistryService.resolve.mockResolvedValue(mockResolvedPrompt);
+      guardrailsService.validateWithRegeneration.mockResolvedValue({
+        success: true,
+        attempt: 1,
+        maxRetries: 3,
+        blocked: false,
+        violations: [],
+      });
+      circuitBreaker.execute.mockRejectedValue(new Error('gRPC call timed out'));
+
+      await expect(service.execute(mockRequest)).rejects.toThrow('gRPC call timed out');
     });
   });
 });

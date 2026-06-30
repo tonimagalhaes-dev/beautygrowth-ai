@@ -78,6 +78,27 @@ describe('Property 21: Guardrails de Sistema São Imutáveis', () => {
       emit: jest.fn(),
     };
 
+    // Mock cache service for distributed cache
+    const mockCacheService = {
+      get: jest.fn().mockResolvedValue(null),
+      set: jest.fn().mockResolvedValue(undefined),
+      delete: jest.fn().mockResolvedValue(undefined),
+      deleteByPattern: jest.fn().mockResolvedValue(0),
+      exists: jest.fn().mockResolvedValue(false),
+      getMetrics: jest.fn(),
+      getHealth: jest.fn(),
+    };
+
+    const mockKeyBuilder = {
+      tenantKey: jest.fn((tenantId: string, resource: string, identifier: string) =>
+        `beautygrowth:cache:tenant:${tenantId}:${resource}:${identifier}`),
+      globalKey: jest.fn((resource: string, identifier: string) =>
+        `beautygrowth:cache:global:${resource}:${identifier}`),
+      tenantPattern: jest.fn(),
+      tenantResourcePattern: jest.fn(),
+      validateTenantId: jest.fn(),
+    };
+
     // Configure findOne to return the correct system guardrail when queried by id
     guardrailRepo.findOne.mockImplementation(async (options: any) => {
       if (options?.where?.id) {
@@ -91,6 +112,8 @@ describe('Property 21: Guardrails de Sistema São Imutáveis', () => {
       violationRepo as any,
       versionRepo as any,
       eventEmitter as any,
+      mockCacheService as any,
+      mockKeyBuilder as any,
     );
 
     return { service, guardrailRepo, violationRepo, versionRepo, eventEmitter };

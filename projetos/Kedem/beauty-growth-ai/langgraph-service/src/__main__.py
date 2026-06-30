@@ -18,7 +18,13 @@ import redis.asyncio as redis
 from .core.agent_router import PostgresAgentRouter
 from .core.state_manager import RedisStateManager
 from .core.workflow_engine import LangGraphWorkflowEngine
+from .grpc.interceptors import (
+    CrossTenantValidationInterceptor,
+    PostgresAuditLogStore,
+    TenantValidationInterceptor,
+)
 from .grpc.server import AgentOrchestrationServicer, serve
+from .workflows.content_agent import build_content_agent_graph
 
 # Configure logging
 logging.basicConfig(
@@ -71,6 +77,11 @@ async def main() -> None:
 
     workflow_engine = LangGraphWorkflowEngine()
 
+    # Register domain-specific workflows
+    content_agent_graph = build_content_agent_graph(pg_pool=pg_pool)
+    workflow_engine.register_workflow("content", content_agent_graph)
+    logger.info("Registered workflow: content (Content Agent)")
+
     agent_router = PostgresAgentRouter(pool=pg_pool)
 
     # Create servicer
@@ -80,11 +91,18 @@ async def main() -> None:
         agent_router=agent_router,
     )
 
+    # Create interceptors for cross-cutting tenant validation
+    audit_log_store = PostgresAuditLogStore(pg_pool=pg_pool)
+    interceptors = [
+        TenantValidationInterceptor(),
+        CrossTenantValidationInterceptor(audit_log_store=audit_log_store),
+    ]
+
     logger.info("All components initialized successfully")
 
     try:
         # Start gRPC server (blocks until shutdown signal)
-        await serve(servicer)
+        await serve(servicer, interceptors=interceptors)
     finally:
         # Cleanup
         logger.info("Cleaning up connections...")

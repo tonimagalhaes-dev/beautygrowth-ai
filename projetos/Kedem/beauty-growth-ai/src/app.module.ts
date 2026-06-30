@@ -15,8 +15,10 @@ import { PrivacyModule } from './modules/privacy/privacy.module';
 import { ObservabilityModule } from './modules/observability/observability.module';
 import { IntegrationModule } from './modules/integration/integration.module';
 import { AgentExecutionModule } from './modules/agent-execution/agent-execution.module';
+import { ContentAgentModule } from './modules/content-agent/content-agent.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { EventBusModule } from './modules/event-bus/event-bus.module';
+import { CacheModule } from './modules/cache/cache.module';
 
 @Module({
   imports: [
@@ -40,6 +42,7 @@ import { EventBusModule } from './modules/event-bus/event-bus.module';
     }),
     EventEmitterModule.forRoot(),
     EventBusModule.forRoot(),
+    CacheModule.forRoot(),
     ClinicModule,
     AgentMemoryModule,
     BusinessMemoryModule,
@@ -51,6 +54,7 @@ import { EventBusModule } from './modules/event-bus/event-bus.module';
     ObservabilityModule,
     IntegrationModule,
     AgentExecutionModule,
+    ContentAgentModule,
     AuthModule,
   ],
   controllers: [AppController],

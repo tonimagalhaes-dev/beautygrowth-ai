@@ -15,6 +15,7 @@ import {
   WorkflowStreamEvent,
   GrpcError,
 } from '../interfaces/grpc-types';
+import { GrpcErrorHandler, GrpcClientError } from './grpc-error-handler';
 
 /**
  * LangGraphClientService manages gRPC communication with the LangGraph Python service.
@@ -59,7 +60,10 @@ export class LangGraphClientService
   /** Path to the proto file */
   private readonly protoPath: string;
 
-  constructor(private readonly configService: ConfigService) {
+  constructor(
+    private readonly configService: ConfigService,
+    private readonly grpcErrorHandler: GrpcErrorHandler,
+  ) {
     this.host = this.configService.get<string>('LANGGRAPH_HOST', 'localhost');
     this.port = this.configService.get<number>('LANGGRAPH_PORT', 50051);
     this.callTimeoutMs = this.configService.get<number>(
@@ -114,6 +118,29 @@ export class LangGraphClientService
     );
   }
 
+  /**
+   * Consume a server-side gRPC stream for workflow execution with partial results.
+   *
+   * Returns an AsyncIterable that yields WorkflowStreamEvent objects in chronological
+   * order as they are produced by the LangGraph service during workflow execution.
+   *
+   * Connection interruption behavior (Requirements: 6.8):
+   * - If the client disconnects (e.g., consumer stops iterating), the LangGraph service
+   *   continues executing the workflow to completion server-side.
+   * - The final result is persisted by the LangGraph State Manager and can be queried
+   *   later via `getExecutionState`.
+   * - The client-side simply stops receiving events; no cleanup RPC is needed.
+   *
+   * Error handling:
+   * - gRPC errors (UNAVAILABLE, DEADLINE_EXCEEDED, etc.) are wrapped into GrpcClientError
+   *   and thrown from the async iterator.
+   * - The deadline timeout applies to the overall stream duration.
+   *
+   * @param request - The workflow execution request with streaming enabled
+   * @yields WorkflowStreamEvent objects (StepStarted, StepCompleted, TokenGenerated,
+   *         WorkflowCompleted, or WorkflowError)
+   * @throws GrpcClientError if the stream encounters a gRPC error
+   */
   async *executeWorkflowStream(
     request: ExecuteWorkflowRequest,
   ): AsyncIterable<WorkflowStreamEvent> {
@@ -399,21 +426,12 @@ export class LangGraphClientService
   }
 
   /**
-   * Wrap a raw gRPC error into a typed GrpcError.
+   * Wrap a raw gRPC error into a typed GrpcClientError using the GrpcErrorHandler.
    * Requirements: 1.6 — return typed error with code, message, and trace_id.
+   * Requirements: 1.7 — timeout errors are properly categorized.
    */
-  private wrapGrpcError(error: any, traceId: string): GrpcError & Error {
-    const code = error.code ?? grpc.status.UNKNOWN;
-    const message = error.details || error.message || 'Unknown gRPC error';
-
-    const grpcError = new Error(
-      `gRPC error [${grpc.status[code] || code}]: ${message} (trace: ${traceId})`,
-    ) as GrpcError & Error;
-
-    grpcError.code = code;
-    grpcError.traceId = traceId;
-
-    return grpcError;
+  private wrapGrpcError(error: any, traceId: string): GrpcClientError {
+    return this.grpcErrorHandler.handleError(error, traceId);
   }
 
   // ===========================================================================

@@ -33,12 +33,14 @@ from ..core.agent_router import (
     NodeDefinition,
     EdgeDefinition,
 )
+from ..core.exceptions import PersistenceError
 from ..core.graph_builder import build_agent_graph
 from ..core.state_manager import RedisStateManager
 from ..core.workflow_engine import (
     ExecutionConfig,
     ExecutionResult,
     LangGraphWorkflowEngine,
+    WorkflowEvent,
     WorkflowNotFoundError as EngineWorkflowNotFoundError,
 )
 
@@ -87,6 +89,14 @@ class ExecutionStateResponse:
     completed_nodes: List[str] = field(default_factory=list)
     created_at: str = ""
     updated_at: str = ""
+
+
+@dataclass
+class CancelExecutionResponse:
+    """Maps to protobuf CancelExecutionResponse message."""
+
+    success: bool = False
+    message: str = ""
 
 
 @dataclass
@@ -237,7 +247,10 @@ class AgentOrchestrationServicer:
                 config=config,
             )
 
-            # Step 6: Persist final state
+            # Step 6: Determine terminal status from result
+            terminal_status = _determine_terminal_status(result)
+
+            # Step 7: Persist final state (all terminal states must be persisted)
             final_state_data = {
                 "execution_id": execution_id,
                 "workflow_id": resolved_workflow_id,
@@ -246,7 +259,7 @@ class AgentOrchestrationServicer:
                 "conversation_id": conversation_id,
                 "user_id": user_id,
                 "user_input": user_input,
-                "status": "completed" if result.success else "failed",
+                "status": terminal_status,
                 "output": result.output,
                 "state_data": result.final_state,
                 "steps": [_step_result_to_dict(s) for s in result.steps],
@@ -261,16 +274,42 @@ class AgentOrchestrationServicer:
                 "completed_at": datetime.now(timezone.utc),
             }
 
-            await self._state_manager.persist_final_state(
-                execution_id=execution_id,
-                tenant_id=tenant_id,
-                final_state=final_state_data,
-                trace_id=trace_id,
-            )
+            persistence_failed = False
+            try:
+                await self._state_manager.persist_final_state(
+                    execution_id=execution_id,
+                    tenant_id=tenant_id,
+                    final_state=final_state_data,
+                    trace_id=trace_id,
+                )
+            except PersistenceError as pe:
+                # Requirement 10.5: If persistence fails, log with trace_id
+                # and execution_id for recovery, but still return the result
+                persistence_failed = True
+                logger.error(
+                    "Failed to persist final state for execution: "
+                    "trace_id=%s, execution_id=%s, error=%s",
+                    trace_id,
+                    execution_id,
+                    str(pe),
+                    extra={
+                        "trace_id": trace_id,
+                        "execution_id": execution_id,
+                        "tenant_id": tenant_id,
+                        "status": terminal_status,
+                    },
+                )
 
-            # Step 7: Build and return response
+            # Step 8: Build and return response
+            # If persistence failed, indicate in blocked_reason but still return result
+            effective_blocked_reason = result.blocked_reason or ""
+            if persistence_failed and not effective_blocked_reason:
+                effective_blocked_reason = (
+                    "State may not have been persisted due to storage failure"
+                )
+
             response = ExecuteWorkflowResponse(
-                success=result.success,
+                success=result.success if not persistence_failed else False,
                 output=result.output,
                 trace_id=trace_id,
                 model_id=result.model_id,
@@ -280,13 +319,13 @@ class AgentOrchestrationServicer:
                     output_tokens=result.tokens_used.output_tokens,
                 ),
                 duration_ms=result.duration_ms,
-                blocked_reason=result.blocked_reason or "",
+                blocked_reason=effective_blocked_reason,
                 guardrail_violations=result.guardrail_violations or [],
                 final_state=ExecutionStateResponse(
                     execution_id=execution_id,
                     workflow_id=resolved_workflow_id,
                     tenant_id=tenant_id,
-                    status="completed" if result.success else "failed",
+                    status=terminal_status if not persistence_failed else "failed",
                     state_data=result.final_state,
                     current_node="",
                     completed_nodes=[s.node_id for s in result.steps],
@@ -311,10 +350,14 @@ class AgentOrchestrationServicer:
             )
 
             logger.info(
-                "ExecuteWorkflow completed: execution_id=%s, success=%s, duration_ms=%d",
+                "ExecuteWorkflow completed: execution_id=%s, success=%s, "
+                "status=%s, duration_ms=%d, tokens_input=%d, tokens_output=%d",
                 execution_id,
                 result.success,
+                terminal_status,
                 result.duration_ms,
+                result.tokens_used.input_tokens,
+                result.tokens_used.output_tokens,
             )
 
             return asdict(response)
@@ -368,6 +411,182 @@ class AgentOrchestrationServicer:
                 grpc.StatusCode.INTERNAL,
                 f"Internal error during workflow execution: {type(e).__name__}",
             )
+
+    async def ExecuteWorkflowStream(
+        self,
+        request: Any,
+        context: grpc.aio.ServicerContext,
+    ):
+        """Handle ExecuteWorkflowStream RPC (server-side streaming).
+
+        Orchestrates workflow execution with streaming events:
+        1. Extract tenant_id, agent_id, user_input from request
+        2. Generate execution_id (UUID)
+        3. Resolve workflow via agent_router
+        4. Build graph from resolved workflow definition
+        5. Register workflow in engine
+        6. Create initial state via state_manager
+        7. Execute workflow with streaming via engine.execute_stream()
+        8. Map internal WorkflowEvent to proto-compatible stream event dicts
+        9. Yield events to the client
+        10. If enable_streaming=false: skip intermediate events, only emit terminal
+
+        Args:
+            request: ExecuteWorkflowRequest (dict-like or protobuf message).
+            context: gRPC servicer context for error handling.
+
+        Yields:
+            Dicts representing WorkflowStreamEvent messages.
+        """
+        # Extract fields from request
+        tenant_id = _get_field(request, "tenant_id", "")
+        agent_id = _get_field(request, "agent_id", "")
+        user_input = _get_field(request, "user_input", "")
+        user_id = _get_field(request, "user_id", "")
+        conversation_id = _get_field(request, "conversation_id", "")
+        tenant_context = _get_field(request, "tenant_context", {})
+
+        # Extract execution options
+        options = _get_field(request, "options", {})
+        max_steps = _get_nested_field(options, "max_steps", 50)
+        timeout_ms = _get_nested_field(options, "timeout_ms", 120_000)
+        enable_streaming = _get_nested_field(options, "enable_streaming", True)
+
+        # Generate identifiers
+        execution_id = str(uuid.uuid4())
+        trace_id = str(uuid.uuid4())
+
+        logger.info(
+            "ExecuteWorkflowStream started: execution_id=%s, agent_id=%s, tenant_id=%s, streaming=%s",
+            execution_id,
+            agent_id,
+            tenant_id,
+            enable_streaming,
+        )
+
+        try:
+            # Step 1: Resolve workflow via Agent Router
+            resolved = await self._agent_router.resolve_workflow(
+                agent_id=agent_id,
+                tenant_id=tenant_id,
+                context=tenant_context if tenant_context else None,
+            )
+
+            resolved_workflow_id = resolved.workflow_id
+
+            # Step 2: Build graph from resolved workflow definition
+            workflow_definition = _build_workflow_definition_from_resolved(resolved)
+            compiled_graph = build_agent_graph(workflow_definition)
+
+            # Step 3: Register workflow in engine
+            self._workflow_engine.register_workflow(resolved_workflow_id, compiled_graph)
+
+            # Step 4: Create initial state via State Manager
+            initial_state = {
+                "user_input": user_input,
+                "tenant_id": tenant_id,
+                "agent_id": agent_id,
+                "conversation_id": conversation_id,
+                "messages": [],
+                "intermediate_results": {},
+                "output": "",
+                "steps": [],
+            }
+
+            await self._state_manager.create_state(
+                execution_id=execution_id,
+                tenant_id=tenant_id,
+                workflow_id=resolved_workflow_id,
+                initial_state=initial_state,
+                trace_id=trace_id,
+            )
+
+            # Step 5: Execute workflow with streaming
+            config = ExecutionConfig(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                trace_id=trace_id,
+                max_steps=max_steps or 50,
+                timeout_ms=timeout_ms or 120_000,
+            )
+
+            async for event in self._workflow_engine.execute_stream(
+                workflow_id=resolved_workflow_id,
+                initial_state=initial_state,
+                config=config,
+            ):
+                stream_event = _map_workflow_event_to_stream(event)
+
+                # If streaming is disabled, only emit terminal events
+                if not enable_streaming:
+                    if event.event_type in ("workflow_completed", "workflow_error"):
+                        yield stream_event
+                else:
+                    yield stream_event
+
+            logger.info(
+                "ExecuteWorkflowStream completed: execution_id=%s",
+                execution_id,
+            )
+
+        except AgentNotFoundError as e:
+            logger.warning(
+                "Agent not found: agent_id=%s, tenant_id=%s, error=%s",
+                agent_id,
+                tenant_id,
+                str(e),
+            )
+            # Emit workflow_error event and close stream
+            yield {
+                "workflow_error": {
+                    "error_code": "NOT_FOUND",
+                    "error_message": f"Agent not found: {agent_id}",
+                    "node_id": "",
+                }
+            }
+
+        except RouterWorkflowNotFoundError as e:
+            logger.warning(
+                "Workflow not found for agent: agent_id=%s, tenant_id=%s",
+                agent_id,
+                tenant_id,
+            )
+            yield {
+                "workflow_error": {
+                    "error_code": "NOT_FOUND",
+                    "error_message": f"No active workflow found for agent_id={agent_id}, tenant_id={tenant_id}",
+                    "node_id": "",
+                }
+            }
+
+        except RouterConnectionError as e:
+            logger.error(
+                "Router connection error: agent_id=%s, tenant_id=%s, error=%s",
+                agent_id,
+                tenant_id,
+                str(e),
+            )
+            yield {
+                "workflow_error": {
+                    "error_code": "UNAVAILABLE",
+                    "error_message": "Service temporarily unavailable: database connection error",
+                    "node_id": "",
+                }
+            }
+
+        except Exception as e:
+            logger.exception(
+                "Unexpected error in ExecuteWorkflowStream: execution_id=%s, error=%s",
+                execution_id,
+                str(e),
+            )
+            yield {
+                "workflow_error": {
+                    "error_code": "INTERNAL",
+                    "error_message": f"Internal error during workflow execution: {type(e).__name__}",
+                    "node_id": "",
+                }
+            }
 
     async def GetExecutionState(
         self,
@@ -450,6 +669,161 @@ class AgentOrchestrationServicer:
             )
             return {}
 
+    async def CancelExecution(
+        self,
+        request: Any,
+        context: grpc.aio.ServicerContext,
+    ) -> Dict[str, Any]:
+        """Handle CancelExecution RPC.
+
+        Cancels a running execution, persists partial state, and returns
+        a CancelExecutionResponse indicating success or failure.
+
+        Multi-tenant isolation: if the execution_id doesn't exist or belongs
+        to a different tenant, returns success=false with a generic
+        "not found" message without revealing existence to another tenant.
+
+        Args:
+            request: CancelExecutionRequest (dict-like or protobuf message).
+            context: gRPC servicer context for error handling.
+
+        Returns:
+            Dict representing CancelExecutionResponse.
+        """
+        execution_id = _get_field(request, "execution_id", "")
+        tenant_id = _get_field(request, "tenant_id", "")
+
+        logger.info(
+            "CancelExecution: execution_id=%s, tenant_id=%s",
+            execution_id,
+            tenant_id,
+        )
+
+        if not execution_id or not tenant_id:
+            return asdict(CancelExecutionResponse(
+                success=False,
+                message="execution_id and tenant_id are required",
+            ))
+
+        try:
+            # Query current state from State Manager (tenant-scoped)
+            state = await self._state_manager.get_state(
+                execution_id=execution_id,
+                tenant_id=tenant_id,
+            )
+
+            # If state is None: execution doesn't exist or doesn't belong to this tenant
+            if state is None:
+                logger.info(
+                    "CancelExecution: execution not found for tenant: "
+                    "execution_id=%s, tenant_id=%s",
+                    execution_id,
+                    tenant_id,
+                )
+                return asdict(CancelExecutionResponse(
+                    success=False,
+                    message="Execution not found",
+                ))
+
+            # Check if execution is already in a terminal status
+            current_status = state.get("status", "")
+            terminal_statuses = {"completed", "failed", "timeout", "cancelled"}
+
+            if current_status in terminal_statuses:
+                logger.info(
+                    "CancelExecution: cannot cancel execution with terminal status: "
+                    "execution_id=%s, status=%s",
+                    execution_id,
+                    current_status,
+                )
+                return asdict(CancelExecutionResponse(
+                    success=False,
+                    message=f"Cannot cancel execution with status: {current_status}",
+                ))
+
+            # Execution is running/pending — cancel it
+            now = datetime.now(timezone.utc)
+            created_at_str = state.get("created_at", "")
+            duration_ms = 0
+            if created_at_str:
+                try:
+                    created_at = datetime.fromisoformat(created_at_str)
+                    duration_ms = int((now - created_at).total_seconds() * 1000)
+                except (ValueError, TypeError):
+                    duration_ms = 0
+
+            # Build cancellation state update
+            cancellation_update = {
+                "status": "cancelled",
+                "current_node": state.get("current_node", ""),
+                "duration_ms": duration_ms,
+                "completed_at": now.isoformat(),
+                "updated_at": now.isoformat(),
+            }
+
+            # Update state in Redis
+            await self._state_manager.update_state(
+                execution_id=execution_id,
+                tenant_id=tenant_id,
+                state_update=cancellation_update,
+            )
+
+            # Persist final state to PostgreSQL
+            # If persistence fails, log for recovery but still return success
+            # to the client (the cancellation itself succeeded)
+            final_state = {
+                **state,
+                **cancellation_update,
+                "tokens_input": state.get("tokens_input", 0),
+                "tokens_output": state.get("tokens_output", 0),
+            }
+            try:
+                await self._state_manager.persist_final_state(
+                    execution_id=execution_id,
+                    tenant_id=tenant_id,
+                    final_state=final_state,
+                )
+            except PersistenceError as pe:
+                # Requirement 10.5: Log with trace_id and execution_id for recovery
+                trace_id = state.get("trace_id", "unknown")
+                logger.error(
+                    "Failed to persist cancelled state: "
+                    "trace_id=%s, execution_id=%s, error=%s",
+                    trace_id,
+                    execution_id,
+                    str(pe),
+                    extra={
+                        "trace_id": trace_id,
+                        "execution_id": execution_id,
+                        "tenant_id": tenant_id,
+                        "status": "cancelled",
+                    },
+                )
+
+            logger.info(
+                "CancelExecution succeeded: execution_id=%s, duration_ms=%d",
+                execution_id,
+                duration_ms,
+            )
+
+            return asdict(CancelExecutionResponse(
+                success=True,
+                message="Execution cancelled successfully",
+            ))
+
+        except grpc.aio.AbortError:
+            raise
+        except Exception as e:
+            logger.exception(
+                "Error in CancelExecution: execution_id=%s, error=%s",
+                execution_id,
+                str(e),
+            )
+            return asdict(CancelExecutionResponse(
+                success=False,
+                message=f"Internal error during cancellation: {type(e).__name__}",
+            ))
+
 
 # ============================================================
 # serve() function
@@ -459,6 +833,7 @@ class AgentOrchestrationServicer:
 async def serve(
     servicer: AgentOrchestrationServicer,
     port: Optional[int] = None,
+    interceptors: Optional[List[Any]] = None,
 ) -> None:
     """Start the gRPC server with graceful shutdown support.
 
@@ -468,12 +843,14 @@ async def serve(
     Args:
         servicer: The AgentOrchestrationServicer instance to register.
         port: Port to listen on. Defaults to GRPC_PORT env var or 50051.
+        interceptors: List of gRPC server interceptors to apply.
     """
     if port is None:
         port = int(os.environ.get("GRPC_PORT", str(DEFAULT_PORT)))
 
     server = grpc.aio.server(
         futures.ThreadPoolExecutor(max_workers=MAX_WORKERS),
+        interceptors=interceptors or [],
     )
 
     # Register servicer — in production this would use the generated
@@ -609,6 +986,30 @@ def _step_result_to_dict(step: Any) -> Dict[str, Any]:
     }
 
 
+def _determine_terminal_status(result: ExecutionResult) -> str:
+    """Determine the terminal status from an ExecutionResult.
+
+    Maps the execution result to one of the terminal statuses:
+    - 'completed': successful execution
+    - 'timeout': execution exceeded timeout_ms
+    - 'failed': any other failure (guardrail, node error, recursion limit, etc.)
+
+    Args:
+        result: The ExecutionResult from the workflow engine.
+
+    Returns:
+        Terminal status string: 'completed', 'timeout', or 'failed'.
+    """
+    if result.success:
+        return "completed"
+
+    # Check if it's a timeout by inspecting blocked_reason
+    if result.blocked_reason and "TIMEOUT" in result.blocked_reason.upper():
+        return "timeout"
+
+    return "failed"
+
+
 def _build_workflow_definition_from_resolved(
     resolved: ResolvedWorkflow,
 ) -> WorkflowDefinition:
@@ -656,3 +1057,64 @@ def _build_workflow_definition_from_resolved(
         edges=edges,
         entry_point=entry_point,
     )
+
+
+def _map_workflow_event_to_stream(event: WorkflowEvent) -> Dict[str, Any]:
+    """Map an internal WorkflowEvent to a proto-compatible stream event dict.
+
+    Maps event_type to the appropriate oneof field in WorkflowStreamEvent:
+      - "step_started" → {"step_started": {"node_id": ..., "node_type": ...}}
+      - "step_completed" → {"step_completed": {"result": {...}}}
+      - "token_generated" → {"token_generated": {"token": ..., "node_id": ...}}
+      - "workflow_completed" → {"workflow_completed": {"response": {...}}}
+      - "workflow_error" → {"workflow_error": {"error_code": ..., "error_message": ..., "node_id": ...}}
+
+    Args:
+        event: The WorkflowEvent from the workflow engine.
+
+    Returns:
+        Dict representing a WorkflowStreamEvent protobuf message.
+    """
+    if event.event_type == "step_started":
+        return {
+            "step_started": {
+                "node_id": event.node_id or "",
+                "node_type": event.data.get("node_type", ""),
+            }
+        }
+    elif event.event_type == "step_completed":
+        return {
+            "step_completed": {
+                "result": event.data.get("result", {}),
+            }
+        }
+    elif event.event_type == "token_generated":
+        return {
+            "token_generated": {
+                "token": event.data.get("token", ""),
+                "node_id": event.node_id or "",
+            }
+        }
+    elif event.event_type == "workflow_completed":
+        return {
+            "workflow_completed": {
+                "response": event.data,
+            }
+        }
+    elif event.event_type == "workflow_error":
+        return {
+            "workflow_error": {
+                "error_code": event.data.get("error_code", "UNKNOWN"),
+                "error_message": event.data.get("error_message", ""),
+                "node_id": event.node_id or "",
+            }
+        }
+    else:
+        # Unknown event type — wrap as generic
+        return {
+            "workflow_error": {
+                "error_code": "UNKNOWN_EVENT",
+                "error_message": f"Unknown event type: {event.event_type}",
+                "node_id": event.node_id or "",
+            }
+        }

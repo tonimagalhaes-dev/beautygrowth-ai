@@ -94,3 +94,50 @@ class GuardrailViolationError(Exception):
         self.violations = violations
         message = f"Guardrail violation at node {node_id}: {violations}"
         super().__init__(message[:MAX_ERROR_MESSAGE_LENGTH])
+
+
+class BrandIdentityMissingError(Exception):
+    """Raised when tenant's Business Memory lacks brand identity (tom_de_voz).
+
+    This maps to HTTP 412 Precondition Failed — the tenant must configure
+    their brand identity before generating content.
+
+    Attributes:
+        tenant_id: The tenant whose brand identity is incomplete.
+        http_status: The HTTP status code to map to (412).
+    """
+
+    http_status: int = 412
+
+    def __init__(self, tenant_id: str) -> None:
+        self.tenant_id = tenant_id
+        message = (
+            f"Tenant {tenant_id} does not have brand identity configured "
+            "(tom_de_voz is missing). Please configure brand identity in "
+            "Business Memory before generating content."
+        )
+        super().__init__(message)
+
+
+class ContextLoadError(Exception):
+    """Raised when an external dependency fails during context loading.
+
+    This maps to HTTP 503 Service Unavailable — Business Memory or
+    Knowledge Hub is temporarily unreachable.
+
+    Attributes:
+        service: The service that failed (e.g., 'business_memory', 'knowledge_hub').
+        tenant_id: The tenant for which the load failed.
+        http_status: The HTTP status code to map to (503).
+    """
+
+    http_status: int = 503
+
+    def __init__(self, service: str, tenant_id: str, cause: str = "") -> None:
+        self.service = service
+        self.tenant_id = tenant_id
+        detail = f": {cause}" if cause else ""
+        message = (
+            f"Failed to load context from {service} for tenant {tenant_id}{detail}"
+        )
+        super().__init__(message[:MAX_ERROR_MESSAGE_LENGTH])

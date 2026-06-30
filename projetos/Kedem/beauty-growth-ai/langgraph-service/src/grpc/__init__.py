@@ -4,6 +4,11 @@ from .server import AgentOrchestrationServicer, serve
 
 __all__ = ["AgentOrchestrationServicer", "serve"]
 from src.grpc.interceptors import (
+    AuditLogStore,
+    CrossTenantAuditEntry,
+    CrossTenantValidationInterceptor,
+    InMemoryAuditLogStore,
+    PostgresAuditLogStore,
     TenantMismatchError,
     TenantValidationInterceptor,
     check_tenant_consistency,
