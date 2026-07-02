@@ -251,7 +251,7 @@ Implementação da camada de orquestração LangGraph como microsserviço Python
     - Se persistência falha: logar com trace_id e execution_id, retornar FAILED com indicação
     - _Requirements: 10.4, 10.5, 11.3_
 
-- [~] 15. Checkpoint Final - Validação completa
+- [ ] 15. Checkpoint Final - Validação completa
   - Ensure all tests pass, ask the user if questions arise.
 
 ## Notes

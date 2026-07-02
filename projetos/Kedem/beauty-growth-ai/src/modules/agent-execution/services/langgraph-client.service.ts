@@ -65,19 +65,12 @@ export class LangGraphClientService
     private readonly grpcErrorHandler: GrpcErrorHandler,
   ) {
     this.host = this.configService.get<string>('LANGGRAPH_HOST', 'localhost');
-    this.port = this.configService.get<number>('LANGGRAPH_PORT', 50051);
-    this.callTimeoutMs = this.configService.get<number>(
-      'LANGGRAPH_CALL_TIMEOUT_MS',
-      30000,
+    this.port = Number(this.configService.get('LANGGRAPH_PORT', 50051));
+    this.callTimeoutMs = Number(
+      this.configService.get('LANGGRAPH_CALL_TIMEOUT_MS', 30000),
     );
-    this.minPoolSize = this.configService.get<number>(
-      'LANGGRAPH_POOL_MIN',
-      1,
-    );
-    this.maxPoolSize = this.configService.get<number>(
-      'LANGGRAPH_POOL_MAX',
-      10,
-    );
+    this.minPoolSize = Number(this.configService.get('LANGGRAPH_POOL_MIN', 1));
+    this.maxPoolSize = Number(this.configService.get('LANGGRAPH_POOL_MAX', 10));
     this.protoPath = this.configService.get<string>(
       'LANGGRAPH_PROTO_PATH',
       join(process.cwd(), 'proto', 'agent_orchestration.proto'),
@@ -442,19 +435,21 @@ export class LangGraphClientService
    * Convert a TypeScript ExecuteWorkflowRequest to proto-compatible format (snake_case).
    */
   private toProtoRequest(request: ExecuteWorkflowRequest): any {
+    // Note: keepCase is false in proto-loader options, so field names
+    // must be camelCase (proto-loader converts snake_case proto fields to camelCase).
     return {
-      agent_id: request.agentId,
-      tenant_id: request.tenantId,
-      user_input: request.userInput,
-      user_id: request.userId,
-      tenant_context: request.tenantContext,
-      workflow_id: request.workflowId,
-      conversation_id: request.conversationId,
+      agentId: request.agentId,
+      tenantId: request.tenantId,
+      userInput: request.userInput,
+      userId: request.userId,
+      tenantContext: request.tenantContext,
+      workflowId: request.workflowId,
+      conversationId: request.conversationId,
       options: request.options
         ? {
-            max_steps: request.options.maxSteps,
-            timeout_ms: request.options.timeoutMs,
-            enable_streaming: request.options.enableStreaming,
+            maxSteps: request.options.maxSteps,
+            timeoutMs: request.options.timeoutMs,
+            enableStreaming: request.options.enableStreaming,
             metadata: request.options.metadata,
           }
         : undefined,

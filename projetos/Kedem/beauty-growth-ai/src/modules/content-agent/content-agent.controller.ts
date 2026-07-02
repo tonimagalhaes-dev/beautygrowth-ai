@@ -14,7 +14,7 @@ import { CurrentTenant } from '@shared/decorators';
 import { TenantContext } from '@shared/interfaces';
 import { TenantGuard } from '@shared/guards/tenant.guard';
 
-@Controller('api/content-agent')
+@Controller('content-agent')
 @UseGuards(TenantGuard)
 export class ContentAgentController {
   constructor(private readonly contentAgentService: ContentAgentService) {}

@@ -16,6 +16,7 @@ import asyncpg
 import redis.asyncio as redis
 
 from .core.agent_router import PostgresAgentRouter
+from .core.llm_clients import GeminiLLMClient
 from .core.state_manager import RedisStateManager
 from .core.workflow_engine import LangGraphWorkflowEngine
 from .grpc.interceptors import (
@@ -77,8 +78,14 @@ async def main() -> None:
 
     workflow_engine = LangGraphWorkflowEngine()
 
+    # Initialize LLM client (Gemini adapter)
+    # To switch providers, replace GeminiLLMClient with another adapter
+    # (e.g., OpenAILLMClient) that implements the same LLMClient interface.
+    llm_client = GeminiLLMClient()
+    logger.info("LLM client initialized: GeminiLLMClient")
+
     # Register domain-specific workflows
-    content_agent_graph = build_content_agent_graph(pg_pool=pg_pool)
+    content_agent_graph = build_content_agent_graph(pg_pool=pg_pool, llm_client=llm_client)
     workflow_engine.register_workflow("content", content_agent_graph)
     logger.info("Registered workflow: content (Content Agent)")
 

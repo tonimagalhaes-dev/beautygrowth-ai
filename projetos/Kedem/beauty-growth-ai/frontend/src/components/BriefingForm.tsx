@@ -79,9 +79,8 @@ export function BriefingForm({ onSubmit, isLoading = false }: BriefingFormProps)
       idioma,
     };
 
-    if (procedimento.trim()) {
-      data.procedimento = procedimento.trim();
-    }
+    // procedimento não é enviado — backend espera UUID de procedimento cadastrado
+    // TODO: converter para select de procedimentos quando disponível
 
     if (publicoAlvoOverride.trim()) {
       data.publicoAlvoOverride = publicoAlvoOverride.trim();

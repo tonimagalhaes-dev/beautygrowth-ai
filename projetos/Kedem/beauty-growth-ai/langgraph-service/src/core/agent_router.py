@@ -163,13 +163,21 @@ class PostgresAgentRouter:
             RouterConnectionError: If a database connection error occurs.
         """
         # Validate agent_id format before hitting the database
-        if not _UUID_PATTERN.match(agent_id):
-            logger.warning(
-                "Invalid agent_id format: %s (tenant_id=%s)", agent_id, tenant_id
-            )
-            raise AgentNotFoundError(
+        # If agent_id is not a UUID, treat it as a workflow_id directly
+        # (the NestJS Content Agent sends agent_id='content' which matches
+        # the workflow registered in __main__.py)
+        is_uuid = bool(_UUID_PATTERN.match(agent_id))
+
+        if not is_uuid:
+            # Direct workflow resolution — agent_id IS the workflow_id
+            logger.info(
+                "Non-UUID agent_id '%s' — resolving as direct workflow_id (tenant=%s)",
                 agent_id,
-                f"Agent not found: {agent_id} (invalid UUID format)",
+                tenant_id,
+            )
+            return ResolvedWorkflow(
+                workflow_id=agent_id,
+                agent_type=agent_id,
             )
 
         try:

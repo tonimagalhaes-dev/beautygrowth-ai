@@ -6,14 +6,8 @@ import type { LoginResponse } from '@/types/auth'
 const API_BASE_URL = 'http://localhost:3000'
 
 export const mockLoginResponse: LoginResponse = {
-  token: 'fake-jwt-token',
-  user: {
-    id: '1',
-    email: 'test@test.com',
-    name: 'Test User',
-    role: 'admin',
-  },
-  clinicSetup: true,
+  accessToken: 'fake-jwt-token',
+  refreshToken: 'fake-refresh-token',
 }
 
 export const mockGenerateResult: ContentAgentResult = {
