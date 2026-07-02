@@ -72,8 +72,14 @@ services:
       GRPC_PORT: '50051'
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql://beautygrowth:beautygrowth_dev@postgres:5432/beautygrowth_dev
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: '5432'
+      POSTGRES_DB: beautygrowth_dev
+      POSTGRES_USER: beautygrowth
+      POSTGRES_PASSWORD: beautygrowth_dev
       LOG_LEVEL: info
       SERVICE_VERSION: 0.1.0
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY}
     ports:
       - '50051:50051'
     depends_on:

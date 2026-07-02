@@ -16,6 +16,7 @@ async function bootstrap() {
     }),
   );
 
+  app.setGlobalPrefix('api');
   app.enableCors();
 
   const port = process.env.APP_PORT || 3000;

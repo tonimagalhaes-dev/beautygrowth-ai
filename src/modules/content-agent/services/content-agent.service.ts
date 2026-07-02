@@ -350,12 +350,15 @@ export class ContentAgentService {
   ): 'draft' | 'guardrail_blocked' | 'error' {
     if (
       grpcResponse.blockedReason &&
-      grpcResponse.blockedReason.length > 0
+      grpcResponse.blockedReason.length > 0 &&
+      !grpcResponse.blockedReason.includes('persisted due to storage failure')
     ) {
       return 'guardrail_blocked';
     }
 
-    if (!grpcResponse.success) {
+    // If output is present, treat as draft even if success=false
+    // (persistence failures on the Python side set success=false but still return content)
+    if (!grpcResponse.success && !grpcResponse.output) {
       return 'error';
     }
 

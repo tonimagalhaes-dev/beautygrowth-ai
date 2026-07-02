@@ -7,6 +7,7 @@ import {
   ArrayMinSize,
   ArrayMaxSize,
   IsOptional,
+  IsUUID,
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { ColorEntryDto } from './color-entry.dto';
@@ -44,4 +45,8 @@ export class CreateBrandDto {
   @IsOptional()
   @IsString()
   logo?: string;
+
+  @IsOptional()
+  @IsUUID()
+  tenantId?: string;
 }

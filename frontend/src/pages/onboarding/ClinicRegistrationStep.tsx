@@ -10,14 +10,24 @@ import { useClinic } from '@/hooks/useClinic';
 import type { CreateClinicRequest } from '@/types/clinic';
 
 const ESPECIALIDADES_OPTIONS = [
-  'Dermatologia Estética',
-  'Cirurgia Plástica',
   'Harmonização Facial',
-  'Medicina Estética',
-  'Estética Corporal',
-  'Tricologia',
-  'Odontologia Estética',
-  'Nutrição Estética',
+  'Botox',
+  'Preenchimento Labial',
+  'Bioestimuladores',
+  'Fios de PDO',
+  'Limpeza de Pele',
+  'Peeling',
+  'Microagulhamento',
+  'Laser',
+  'Depilação a Laser',
+  'Criolipólise',
+  'Lipocavitação',
+  'Radiofrequência',
+  'Drenagem Linfática',
+  'Massagem Modeladora',
+  'Tratamento de Acne',
+  'Tratamento de Melasma',
+  'Tratamento Capilar',
 ];
 
 interface ClinicRegistrationStepProps {

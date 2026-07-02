@@ -1,0 +1,189 @@
+syntax = "proto3";
+
+package beautygrowth.orchestration.v1;
+
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+// Serviço principal de orquestração de agentes
+service AgentOrchestrationService {
+  // Executa um workflow de agente completo
+  rpc ExecuteWorkflow(ExecuteWorkflowRequest) returns (ExecuteWorkflowResponse);
+
+  // Executa um workflow com streaming de resultados parciais
+  rpc ExecuteWorkflowStream(ExecuteWorkflowRequest) returns (stream WorkflowStreamEvent);
+
+  // Consulta o estado de uma execução em andamento ou finalizada
+  rpc GetExecutionState(GetExecutionStateRequest) returns (ExecutionState);
+
+  // Cancela uma execução em andamento
+  rpc CancelExecution(CancelExecutionRequest) returns (CancelExecutionResponse);
+
+  // Health check do serviço
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+// ============================================================
+// Enums
+// ============================================================
+
+enum ExecutionStatus {
+  EXECUTION_STATUS_UNSPECIFIED = 0;
+  EXECUTION_STATUS_PENDING = 1;
+  EXECUTION_STATUS_RUNNING = 2;
+  EXECUTION_STATUS_COMPLETED = 3;
+  EXECUTION_STATUS_FAILED = 4;
+  EXECUTION_STATUS_CANCELLED = 5;
+  EXECUTION_STATUS_TIMEOUT = 6;
+}
+
+enum ServiceStatus {
+  SERVICE_STATUS_UNSPECIFIED = 0;
+  SERVICE_STATUS_SERVING = 1;
+  SERVICE_STATUS_NOT_SERVING = 2;
+}
+
+// ============================================================
+// Request / Response Messages
+// ============================================================
+
+// Request para execução de workflow
+message ExecuteWorkflowRequest {
+  string agent_id = 1;
+  string tenant_id = 2;
+  string user_input = 3;
+  string user_id = 4;
+  map<string, string> tenant_context = 5;
+  string workflow_id = 6;        // Opcional: ID de workflow específico (para multi-agente)
+  string conversation_id = 7;   // Para manter contexto conversacional
+  ExecutionOptions options = 8;
+}
+
+message ExecutionOptions {
+  int32 max_steps = 1;                  // Limite de passos no grafo
+  int32 timeout_ms = 2;                 // Timeout da execução
+  bool enable_streaming = 3;            // Habilitar eventos parciais
+  map<string, string> metadata = 4;     // Metadata adicional para tracing
+}
+
+// Resposta da execução de workflow
+message ExecuteWorkflowResponse {
+  bool success = 1;
+  string output = 2;
+  string trace_id = 3;
+  string model_id = 4;
+  bool used_fallback = 5;
+  TokenUsage tokens_used = 6;
+  int64 duration_ms = 7;
+  string blocked_reason = 8;
+  repeated string guardrail_violations = 9;
+  ExecutionState final_state = 10;
+  repeated StepResult steps = 11;       // Detalhes de cada passo executado
+}
+
+// ============================================================
+// Shared Messages
+// ============================================================
+
+message TokenUsage {
+  int32 input_tokens = 1;
+  int32 output_tokens = 2;
+}
+
+// Resultado de um passo individual do workflow
+message StepResult {
+  string node_id = 1;
+  string node_type = 2;         // "agent", "tool", "condition", "parallel"
+  string output = 3;
+  int64 duration_ms = 4;
+  TokenUsage tokens_used = 5;
+  ExecutionStatus status = 6;
+  string error_message = 7;
+}
+
+// Estado da execução (para consulta e persistência)
+message ExecutionState {
+  string execution_id = 1;
+  string workflow_id = 2;
+  string tenant_id = 3;
+  ExecutionStatus status = 4;
+  google.protobuf.Struct state_data = 5;   // Estado do LangGraph serializado
+  string current_node = 6;
+  repeated string completed_nodes = 7;
+  google.protobuf.Timestamp created_at = 8;
+  google.protobuf.Timestamp updated_at = 9;
+}
+
+// ============================================================
+// Streaming Messages
+// ============================================================
+
+// Eventos de streaming durante execução
+message WorkflowStreamEvent {
+  oneof event {
+    StepStarted step_started = 1;
+    StepCompleted step_completed = 2;
+    TokenGenerated token_generated = 3;
+    WorkflowCompleted workflow_completed = 4;
+    WorkflowError workflow_error = 5;
+  }
+}
+
+message StepStarted {
+  string node_id = 1;
+  string node_type = 2;
+}
+
+message StepCompleted {
+  StepResult result = 1;
+}
+
+message TokenGenerated {
+  string token = 1;
+  string node_id = 2;
+}
+
+message WorkflowCompleted {
+  ExecuteWorkflowResponse response = 1;
+}
+
+message WorkflowError {
+  string error_code = 1;
+  string error_message = 2;
+  string node_id = 3;
+}
+
+// ============================================================
+// Health Check Messages
+// ============================================================
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  ServiceStatus status = 1;
+  string version = 2;
+  map<string, string> details = 3;
+}
+
+// ============================================================
+// Execution State Query Messages
+// ============================================================
+
+message GetExecutionStateRequest {
+  string execution_id = 1;
+  string tenant_id = 2;
+}
+
+// ============================================================
+// Cancellation Messages
+// ============================================================
+
+message CancelExecutionRequest {
+  string execution_id = 1;
+  string tenant_id = 2;
+}
+
+message CancelExecutionResponse {
+  bool success = 1;
+  string message = 2;
+}

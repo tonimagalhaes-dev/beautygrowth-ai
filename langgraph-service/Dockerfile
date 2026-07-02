@@ -12,12 +12,24 @@ RUN apt-get update && \
 COPY pyproject.toml .
 COPY src/ src/
 
+# Copy proto file for stub generation
+COPY proto/ proto/
+
 # Install dependencies into a virtual environment
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir .
+
+# Generate gRPC stubs with the same protobuf version installed in the venv
+RUN python -m grpc_tools.protoc \
+    -I./proto \
+    --python_out=./src/grpc/generated \
+    --grpc_python_out=./src/grpc/generated \
+    ./proto/agent_orchestration.proto && \
+    sed -i 's/import agent_orchestration_pb2 as/from . import agent_orchestration_pb2 as/' \
+    ./src/grpc/generated/agent_orchestration_pb2_grpc.py
 
 # Stage 2: Runtime
 FROM python:3.11-slim AS runtime
@@ -28,8 +40,8 @@ WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Copy application source
-COPY src/ src/
+# Copy application source from builder (includes generated gRPC stubs)
+COPY --from=builder /app/src/ src/
 
 # Create non-root user
 RUN useradd --create-home --shell /bin/bash appuser
@@ -42,5 +54,5 @@ EXPOSE 50051
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD python -c "import grpc; print('ok')" || exit 1
 
-# Run gRPC server
-CMD ["python", "-m", "src.grpc.server"]
+# Run the service via __main__.py (initializes LLM client, workflows, and gRPC server)
+CMD ["python", "-m", "src"]

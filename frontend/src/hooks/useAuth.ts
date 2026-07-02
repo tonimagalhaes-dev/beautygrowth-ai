@@ -2,6 +2,7 @@ import { useState, useCallback } from 'react';
 import { useMutation } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 import { authService } from '@/services/auth.service';
+import { clinicService } from '@/services/clinic.service';
 import type { LoginRequest, LoginResponse } from '@/types/auth';
 
 export interface UseAuthReturn {
@@ -23,14 +24,19 @@ export function useAuth(): UseAuthReturn {
 
   const loginMutation = useMutation<LoginResponse, Error, LoginRequest>({
     mutationFn: authService.login,
-    onSuccess: (data) => {
-      localStorage.setItem('auth_token', data.token);
+    onSuccess: async (data) => {
+      localStorage.setItem('auth_token', data.accessToken);
       setIsAuthenticated(true);
-      setClinicSetup(data.clinicSetup);
 
-      if (data.clinicSetup) {
+      // Check if clinic is already set up
+      try {
+        await clinicService.getMyClinic();
+        // Clinic exists — go to content generation
+        setClinicSetup(true);
         navigate('/content');
-      } else {
+      } catch {
+        // No clinic yet (404 or error) — go to onboarding
+        setClinicSetup(false);
         navigate('/onboarding');
       }
     },

@@ -11,9 +11,8 @@ export interface LoginRequest {
 }
 
 export interface LoginResponse {
-  token: string;
-  user: User;
-  clinicSetup: boolean;
+  accessToken: string;
+  refreshToken: string;
 }
 
 export interface AuthState {

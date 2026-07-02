@@ -205,12 +205,18 @@ class AgentOrchestrationServicer:
 
             resolved_workflow_id = resolved.workflow_id
 
-            # Step 2: Build graph from resolved workflow definition
-            workflow_definition = _build_workflow_definition_from_resolved(resolved)
-            compiled_graph = build_agent_graph(workflow_definition)
+            # Step 2: Only build & register if workflow not already registered
+            if resolved_workflow_id not in self._workflow_engine._workflows:
+                workflow_definition = _build_workflow_definition_from_resolved(resolved)
+                compiled_graph = build_agent_graph(workflow_definition)
+                self._workflow_engine.register_workflow(resolved_workflow_id, compiled_graph)
 
-            # Step 3: Register workflow in engine
-            self._workflow_engine.register_workflow(resolved_workflow_id, compiled_graph)
+
+
+
+
+
+
 
             # Step 4: Create initial state via State Manager
             initial_state = {
@@ -474,12 +480,18 @@ class AgentOrchestrationServicer:
 
             resolved_workflow_id = resolved.workflow_id
 
-            # Step 2: Build graph from resolved workflow definition
-            workflow_definition = _build_workflow_definition_from_resolved(resolved)
-            compiled_graph = build_agent_graph(workflow_definition)
+            # Step 2: Only build & register if workflow not already registered
+            if resolved_workflow_id not in self._workflow_engine._workflows:
+                workflow_definition = _build_workflow_definition_from_resolved(resolved)
+                compiled_graph = build_agent_graph(workflow_definition)
+                self._workflow_engine.register_workflow(resolved_workflow_id, compiled_graph)
 
-            # Step 3: Register workflow in engine
-            self._workflow_engine.register_workflow(resolved_workflow_id, compiled_graph)
+
+
+
+
+
+
 
             # Step 4: Create initial state via State Manager
             initial_state = {
@@ -894,34 +906,164 @@ def _register_servicer(
     server: grpc.aio.Server,
     servicer: AgentOrchestrationServicer,
 ) -> None:
-    """Register the servicer's handlers with the gRPC server.
+    """Register the servicer's handlers with the gRPC server using generated stubs.
 
-    Uses generic handler registration since generated stubs may not exist yet.
-    When protobuf stubs are generated, this should be replaced with:
-        add_AgentOrchestrationServiceServicer_to_server(servicer, server)
+    Wraps the dict-returning servicer into a proto-compatible servicer
+    that serializes responses to protobuf messages.
 
     Args:
         server: The gRPC async server instance.
         servicer: The servicer to register.
     """
-    from grpc import unary_unary_rpc_method_handler
+    from google.protobuf import json_format, struct_pb2
+    from src.grpc.generated import agent_orchestration_pb2, agent_orchestration_pb2_grpc
 
-    service_name = "beautygrowth.orchestration.v1.AgentOrchestrationService"
+    class _ProtoServicer(agent_orchestration_pb2_grpc.AgentOrchestrationServiceServicer):
+        """Adapter that converts dict responses from servicer to proto messages."""
 
-    # Create method handlers
-    handler = grpc.method_service_handler(
-        None, None, None, None
-    ) if False else None  # noqa: placeholder
+        def _request_to_dict(self, request):
+            """Convert protobuf request to dict for the servicer.
+            
+            Directly extracts fields from protobuf message using attribute access.
+            This avoids issues with MessageToDict not including empty-string fields.
+            """
+            result = {}
+            # Extract all string fields directly
+            for field_name in ['agent_id', 'tenant_id', 'user_input', 'user_id', 
+                             'workflow_id', 'conversation_id']:
+                val = getattr(request, field_name, '')
+                result[field_name] = val
 
-    # Register using generic handlers for now
-    # Once proto stubs are generated, replace with:
-    # from src.grpc.generated import agent_orchestration_pb2_grpc
-    # agent_orchestration_pb2_grpc.add_AgentOrchestrationServiceServicer_to_server(
-    #     servicer, server
-    # )
-    logger.debug(
-        "Servicer registered (generic mode) for service: %s", service_name
+            # Extract tenant_context (map field)
+            tc = getattr(request, 'tenant_context', None)
+            result['tenant_context'] = dict(tc) if tc else {}
+
+            # Extract options (nested message)
+            opts = getattr(request, 'options', None)
+            if opts:
+                result['options'] = {
+                    'max_steps': getattr(opts, 'max_steps', 50),
+                    'timeout_ms': getattr(opts, 'timeout_ms', 120000),
+                    'enable_streaming': getattr(opts, 'enable_streaming', False),
+                    'metadata': dict(getattr(opts, 'metadata', {})),
+                }
+            else:
+                result['options'] = {}
+
+            return result
+
+        async def ExecuteWorkflow(self, request, context):
+            request_dict = self._request_to_dict(request)
+            result = await servicer.ExecuteWorkflow(request_dict, context)
+            if result is None:
+                return agent_orchestration_pb2.ExecuteWorkflowResponse()
+            return _dict_to_execute_response(result)
+
+        async def ExecuteWorkflowStream(self, request, context):
+            request_dict = self._request_to_dict(request)
+            async for event_dict in servicer.ExecuteWorkflowStream(request_dict, context):
+                yield _dict_to_stream_event(event_dict)
+
+        async def GetExecutionState(self, request, context):
+            request_dict = self._request_to_dict(request)
+            result = await servicer.GetExecutionState(request_dict, context)
+            if result is None:
+                return agent_orchestration_pb2.ExecutionState()
+            return _dict_to_execution_state(result)
+
+        async def CancelExecution(self, request, context):
+            request_dict = self._request_to_dict(request)
+            result = await servicer.CancelExecution(request_dict, context)
+            if result is None:
+                return agent_orchestration_pb2.CancelExecutionResponse()
+            resp = agent_orchestration_pb2.CancelExecutionResponse()
+            resp.success = result.get("success", False)
+            resp.message = result.get("message", "")
+            return resp
+
+        async def HealthCheck(self, request, context):
+            resp = agent_orchestration_pb2.HealthCheckResponse()
+            resp.status = agent_orchestration_pb2.SERVICE_STATUS_SERVING
+            resp.version = os.environ.get("SERVICE_VERSION", "0.1.0")
+            return resp
+
+    def _dict_to_execute_response(d: dict) -> agent_orchestration_pb2.ExecuteWorkflowResponse:
+        resp = agent_orchestration_pb2.ExecuteWorkflowResponse()
+        resp.success = d.get("success", False)
+        resp.output = d.get("output", "")
+        resp.trace_id = d.get("trace_id", "")
+        resp.model_id = d.get("model_id", "")
+        resp.used_fallback = d.get("used_fallback", False)
+        resp.duration_ms = d.get("duration_ms", 0)
+        resp.blocked_reason = d.get("blocked_reason", "")
+        for v in d.get("guardrail_violations", []):
+            resp.guardrail_violations.append(v)
+
+        tokens = d.get("tokens_used", {})
+        if tokens:
+            resp.tokens_used.input_tokens = tokens.get("input_tokens", 0)
+            resp.tokens_used.output_tokens = tokens.get("output_tokens", 0)
+
+        steps = d.get("steps", [])
+        for step in steps:
+            s = resp.steps.add()
+            s.node_id = step.get("node_id", "")
+            s.node_type = step.get("node_type", "")
+            s.output = step.get("output", "")
+            s.duration_ms = step.get("duration_ms", 0)
+            s.error_message = step.get("error_message", "")
+            step_tokens = step.get("tokens_used", {})
+            if step_tokens:
+                s.tokens_used.input_tokens = step_tokens.get("input_tokens", 0)
+                s.tokens_used.output_tokens = step_tokens.get("output_tokens", 0)
+
+        return resp
+
+    def _dict_to_execution_state(d: dict) -> agent_orchestration_pb2.ExecutionState:
+        state = agent_orchestration_pb2.ExecutionState()
+        state.execution_id = d.get("execution_id", "")
+        state.workflow_id = d.get("workflow_id", "")
+        state.tenant_id = d.get("tenant_id", "")
+        state.current_node = d.get("current_node", "")
+        for n in d.get("completed_nodes", []):
+            state.completed_nodes.append(n)
+        # state_data as Struct
+        state_data = d.get("state_data", {})
+        if state_data and isinstance(state_data, dict):
+            try:
+                json_format.ParseDict(state_data, state.state_data)
+            except Exception:
+                pass
+        return state
+
+    def _dict_to_stream_event(d: dict) -> agent_orchestration_pb2.WorkflowStreamEvent:
+        event = agent_orchestration_pb2.WorkflowStreamEvent()
+        if "step_started" in d:
+            ss = d["step_started"]
+            event.step_started.node_id = ss.get("node_id", "")
+            event.step_started.node_type = ss.get("node_type", "")
+        elif "step_completed" in d:
+            sc = d["step_completed"]
+            result = sc.get("result", {})
+            event.step_completed.result.node_id = result.get("node_id", "")
+            event.step_completed.result.node_type = result.get("node_type", "")
+            event.step_completed.result.output = result.get("output", "")
+            event.step_completed.result.duration_ms = result.get("duration_ms", 0)
+        elif "workflow_completed" in d:
+            wc = d["workflow_completed"]
+            resp = wc.get("response", {})
+            event.workflow_completed.response.CopyFrom(_dict_to_execute_response(resp))
+        elif "workflow_error" in d:
+            we = d["workflow_error"]
+            event.workflow_error.error_code = we.get("error_code", "")
+            event.workflow_error.error_message = we.get("error_message", "")
+            event.workflow_error.node_id = we.get("node_id", "")
+        return event
+
+    agent_orchestration_pb2_grpc.add_AgentOrchestrationServiceServicer_to_server(
+        _ProtoServicer(), server
     )
+    logger.info("Servicer registered via proto stubs for: beautygrowth.orchestration.v1.AgentOrchestrationService")
 
 
 # ============================================================

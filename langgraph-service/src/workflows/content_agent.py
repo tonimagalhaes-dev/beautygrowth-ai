@@ -724,10 +724,22 @@ def _parse_llm_response(
 
     try:
         parsed = json.loads(json_content)
-    except json.JSONDecodeError as exc:
-        raise ValueError(
-            f"Failed to parse LLM response as JSON: {str(exc)[:200]}"
-        ) from exc
+    except json.JSONDecodeError:
+        # Fallback: try to find JSON object within the text
+        # Look for first '{' and last '}' to extract embedded JSON
+        first_brace = json_content.find("{")
+        last_brace = json_content.rfind("}")
+        if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+            try:
+                parsed = json.loads(json_content[first_brace:last_brace + 1])
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Failed to parse LLM response as JSON: {str(exc)[:200]}"
+                ) from exc
+        else:
+            raise ValueError(
+                f"Failed to parse LLM response as JSON: no JSON object found in response"
+            )
 
     # Extract legendas
     legendas_raw = parsed.get("legendas", {})
@@ -781,31 +793,50 @@ async def _get_model_config(
         Each config dict has: model_name, temperature, max_tokens.
         Returns None for missing configs.
     """
-    rows = await conn.fetch(
+    row = await conn.fetchrow(
         """
-        SELECT am.model_name, ac.temperature, ac.max_tokens, ac.priority
+        SELECT ac.model_id, ac.fallback_model_id, ac.temperature, ac.max_tokens
         FROM agent_configs ac
-        JOIN ai_models am ON am.id = ac.model_id
         WHERE ac.agent_type = $1
-        ORDER BY ac.priority ASC
+          AND ac.status = 'active'
+        LIMIT 1
         """,
         agent_type,
     )
 
-    primary = None
-    fallback = None
+    if row is None:
+        return None, None
 
-    for row in rows:
-        config = {
-            "model_name": row["model_name"],
-            "temperature": float(row["temperature"]) if row["temperature"] else 0.7,
-            "max_tokens": int(row["max_tokens"]) if row["max_tokens"] else 4096,
-        }
-        if primary is None:
-            primary = config
-        elif fallback is None:
-            fallback = config
-            break
+    temperature = float(row["temperature"]) if row["temperature"] else 0.7
+    max_tokens = int(row["max_tokens"]) if row["max_tokens"] else 4096
+
+    # Resolve primary model name
+    primary = None
+    if row["model_id"]:
+        model_row = await conn.fetchrow(
+            "SELECT name FROM ai_models WHERE id = $1",
+            row["model_id"],
+        )
+        if model_row:
+            primary = {
+                "model_name": model_row["name"],
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+
+    # Resolve fallback model name
+    fallback = None
+    if row["fallback_model_id"]:
+        fallback_row = await conn.fetchrow(
+            "SELECT name FROM ai_models WHERE id = $1",
+            row["fallback_model_id"],
+        )
+        if fallback_row:
+            fallback = {
+                "model_name": fallback_row["name"],
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
 
     return primary, fallback
 

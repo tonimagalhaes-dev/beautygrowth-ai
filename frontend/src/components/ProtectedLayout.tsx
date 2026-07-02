@@ -1,11 +1,12 @@
-import { Navigate, Outlet } from 'react-router-dom';
+import { Navigate, Outlet, useLocation } from 'react-router-dom';
 import { Toaster } from '@/components/ui/sonner';
 
 export function ProtectedLayout() {
   const token = localStorage.getItem('auth_token');
+  const location = useLocation();
 
   if (!token) {
-    return <Navigate to="/login" replace />;
+    return <Navigate to="/login" state={{ from: location }} replace />;
   }
 
   return (
