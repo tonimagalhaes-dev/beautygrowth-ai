@@ -332,7 +332,7 @@ export class PromptRegistryService implements IPromptRegistryService {
         resolvedVariables[variable] = context[variable];
         resolvedContent = resolvedContent.replace(
           new RegExp(`\\{\\{${variable}\\}\\}`, 'g'),
-          context[variable],
+          () => context[variable],
         );
       } else {
         unresolvedVariables.push(variable);

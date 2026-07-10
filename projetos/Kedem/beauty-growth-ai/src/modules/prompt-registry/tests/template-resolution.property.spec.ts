@@ -22,6 +22,8 @@ describe('Property 18: Template Variable Resolution', () => {
     service = new PromptRegistryService(
       {} as any, // promptRepository not needed for template resolution
       {} as any, // versionRepository not needed for template resolution
+      {} as any, // cache not needed for template resolution
+      {} as any, // keyBuilder not needed for template resolution
     );
   });
 

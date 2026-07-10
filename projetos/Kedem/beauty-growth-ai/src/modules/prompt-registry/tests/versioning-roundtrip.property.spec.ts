@@ -5,6 +5,8 @@ import { getRepositoryToken } from '@nestjs/typeorm';
 import { PromptRegistryService } from '../services/prompt-registry.service';
 import { Prompt, AgentType, PromptFunction } from '../entities/prompt.entity';
 import { PromptVersion } from '../entities/prompt-version.entity';
+import { CACHE_SERVICE } from '../../cache/config/cache.constants';
+import { CacheKeyBuilder } from '../../cache/services/cache-key-builder.service';
 
 /**
  * Property 19: Prompt Versioning Round-Trip
@@ -117,6 +119,18 @@ describe('Property 19: Prompt Versioning Round-Trip', () => {
         {
           provide: getRepositoryToken(PromptVersion),
           useValue: mockVersionRepository,
+        },
+        {
+          provide: CACHE_SERVICE,
+          useValue: {
+            get: jest.fn().mockResolvedValue(null),
+            set: jest.fn().mockResolvedValue(undefined),
+            delete: jest.fn().mockResolvedValue(undefined),
+          },
+        },
+        {
+          provide: CacheKeyBuilder,
+          useValue: new CacheKeyBuilder(),
         },
       ],
     }).compile();
