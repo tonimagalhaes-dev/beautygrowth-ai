@@ -554,15 +554,15 @@ describe('LangGraphClientService - Streaming', () => {
       const callArgs = mockGrpcClient.ExecuteWorkflowStream.mock.calls[0];
       const protoRequest = callArgs[0];
 
-      expect(protoRequest.agent_id).toBe('agent-test');
-      expect(protoRequest.tenant_id).toBe('tenant-test');
-      expect(protoRequest.user_input).toBe('hello world');
-      expect(protoRequest.user_id).toBe('user-test');
-      expect(protoRequest.workflow_id).toBe('wf-1');
-      expect(protoRequest.conversation_id).toBe('conv-1');
-      expect(protoRequest.options.max_steps).toBe(25);
-      expect(protoRequest.options.timeout_ms).toBe(60000);
-      expect(protoRequest.options.enable_streaming).toBe(true);
+      expect(protoRequest.agentId).toBe('agent-test');
+      expect(protoRequest.tenantId).toBe('tenant-test');
+      expect(protoRequest.userInput).toBe('hello world');
+      expect(protoRequest.userId).toBe('user-test');
+      expect(protoRequest.workflowId).toBe('wf-1');
+      expect(protoRequest.conversationId).toBe('conv-1');
+      expect(protoRequest.options.maxSteps).toBe(25);
+      expect(protoRequest.options.timeoutMs).toBe(60000);
+      expect(protoRequest.options.enableStreaming).toBe(true);
     });
   });
 

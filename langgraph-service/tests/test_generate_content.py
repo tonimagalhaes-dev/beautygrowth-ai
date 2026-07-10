@@ -37,6 +37,29 @@ from src.workflows.content_agent import (
 # --- Helper functions ---
 
 
+def _make_mock_fetchrow(primary_name="gpt-4o", fallback_name="gpt-4o-mini", temperature=0.7, max_tokens=4096):
+    async def mock_fetchrow(query, *args):
+        query_upper = query.upper()
+        if "AGENT_CONFIGS" in query_upper:
+            if not primary_name and not fallback_name:
+                return None
+            return {
+                "model_id": "primary-id" if primary_name else None,
+                "fallback_model_id": "fallback-id" if fallback_name else None,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+        elif "AI_MODELS" in query_upper:
+            model_id = args[0]
+            if model_id == "primary-id":
+                return {"name": primary_name}
+            elif model_id == "fallback-id":
+                return {"name": fallback_name}
+            return None
+        return None
+    return mock_fetchrow
+
+
 def _make_llm_response_json(
     redes_sociais: Optional[List[str]] = None,
     hashtag_count: int = 10,
@@ -326,10 +349,7 @@ class TestGetModelConfig:
     async def test_returns_primary_and_fallback(self):
         """Returns both primary and fallback when 2+ models configured."""
         mock_conn = AsyncMock()
-        mock_conn.fetch = AsyncMock(return_value=[
-            {"model_name": "gpt-4o", "temperature": 0.7, "max_tokens": 4096, "priority": 1},
-            {"model_name": "gpt-4o-mini", "temperature": 0.8, "max_tokens": 2048, "priority": 2},
-        ])
+        mock_conn.fetchrow = AsyncMock(side_effect=_make_mock_fetchrow("gpt-4o", "gpt-4o-mini", 0.7, 4096))
 
         primary, fallback = await _get_model_config(mock_conn, "content")
 
@@ -340,16 +360,14 @@ class TestGetModelConfig:
 
         assert fallback is not None
         assert fallback["model_name"] == "gpt-4o-mini"
-        assert fallback["temperature"] == 0.8
-        assert fallback["max_tokens"] == 2048
+        assert fallback["temperature"] == 0.7
+        assert fallback["max_tokens"] == 4096
 
     @pytest.mark.asyncio
     async def test_returns_primary_only_when_single_model(self):
         """Returns primary and None fallback when only 1 model configured."""
         mock_conn = AsyncMock()
-        mock_conn.fetch = AsyncMock(return_value=[
-            {"model_name": "gpt-4o", "temperature": 0.7, "max_tokens": 4096, "priority": 1},
-        ])
+        mock_conn.fetchrow = AsyncMock(side_effect=_make_mock_fetchrow("gpt-4o", None, 0.7, 4096))
 
         primary, fallback = await _get_model_config(mock_conn, "content")
 
@@ -361,7 +379,7 @@ class TestGetModelConfig:
     async def test_returns_none_when_no_models(self):
         """Returns (None, None) when no models configured."""
         mock_conn = AsyncMock()
-        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_conn.fetchrow = AsyncMock(side_effect=_make_mock_fetchrow(None, None))
 
         primary, fallback = await _get_model_config(mock_conn, "content")
 
@@ -372,9 +390,7 @@ class TestGetModelConfig:
     async def test_defaults_temperature_and_max_tokens(self):
         """Uses defaults when temperature/max_tokens are None."""
         mock_conn = AsyncMock()
-        mock_conn.fetch = AsyncMock(return_value=[
-            {"model_name": "gpt-4o", "temperature": None, "max_tokens": None, "priority": 1},
-        ])
+        mock_conn.fetchrow = AsyncMock(side_effect=_make_mock_fetchrow("gpt-4o", None, None, None))
 
         primary, _ = await _get_model_config(mock_conn, "content")
 
@@ -391,7 +407,12 @@ class TestMakeGenerateContent:
     def _setup_mock_pool(self, model_rows):
         """Create mock pool that returns model config rows."""
         mock_conn = AsyncMock()
-        mock_conn.fetch = AsyncMock(return_value=model_rows)
+        primary_name = model_rows[0]["model_name"] if len(model_rows) > 0 else None
+        fallback_name = model_rows[1]["model_name"] if len(model_rows) > 1 else None
+        temp = model_rows[0].get("temperature", 0.7) if len(model_rows) > 0 else 0.7
+        tokens = model_rows[0].get("max_tokens", 4096) if len(model_rows) > 0 else 4096
+        
+        mock_conn.fetchrow = AsyncMock(side_effect=_make_mock_fetchrow(primary_name, fallback_name, temp, tokens))
         mock_pool = MagicMock()
         return mock_pool, mock_conn
 
@@ -403,10 +424,7 @@ class TestMakeGenerateContent:
 
         mock_pool = MagicMock()
         mock_conn = AsyncMock()
-        mock_conn.fetch = AsyncMock(return_value=[
-            {"model_name": "gpt-4o", "temperature": 0.7, "max_tokens": 4096, "priority": 1},
-            {"model_name": "gpt-4o-mini", "temperature": 0.8, "max_tokens": 2048, "priority": 2},
-        ])
+        mock_conn.fetchrow = AsyncMock(side_effect=_make_mock_fetchrow("gpt-4o", "gpt-4o-mini", 0.7, 4096))
 
         mock_llm = _make_mock_llm_client(response_json, redes)
 
@@ -433,10 +451,7 @@ class TestMakeGenerateContent:
 
         mock_pool = MagicMock()
         mock_conn = AsyncMock()
-        mock_conn.fetch = AsyncMock(return_value=[
-            {"model_name": "gpt-4o", "temperature": 0.7, "max_tokens": 4096, "priority": 1},
-            {"model_name": "gpt-4o-mini", "temperature": 0.8, "max_tokens": 2048, "priority": 2},
-        ])
+        mock_conn.fetchrow = AsyncMock(side_effect=_make_mock_fetchrow("gpt-4o", "gpt-4o-mini", 0.7, 4096))
 
         # LLM client that fails on primary but succeeds on fallback
         mock_llm = _make_mock_llm_client(
@@ -463,10 +478,7 @@ class TestMakeGenerateContent:
         """Both primary and fallback fail → LLMUnavailableError."""
         mock_pool = MagicMock()
         mock_conn = AsyncMock()
-        mock_conn.fetch = AsyncMock(return_value=[
-            {"model_name": "gpt-4o", "temperature": 0.7, "max_tokens": 4096, "priority": 1},
-            {"model_name": "gpt-4o-mini", "temperature": 0.8, "max_tokens": 2048, "priority": 2},
-        ])
+        mock_conn.fetchrow = AsyncMock(side_effect=_make_mock_fetchrow("gpt-4o", "gpt-4o-mini", 0.7, 4096))
 
         mock_llm = _make_mock_llm_client(should_raise=True)
 
@@ -486,7 +498,7 @@ class TestMakeGenerateContent:
         """No model configured in DB → LLMUnavailableError."""
         mock_pool = MagicMock()
         mock_conn = AsyncMock()
-        mock_conn.fetch = AsyncMock(return_value=[])
+        mock_conn.fetchrow = AsyncMock(side_effect=_make_mock_fetchrow(None, None))
 
         mock_llm = _make_mock_llm_client()
 
@@ -504,9 +516,7 @@ class TestMakeGenerateContent:
         """Primary fails and no fallback configured → LLMUnavailableError."""
         mock_pool = MagicMock()
         mock_conn = AsyncMock()
-        mock_conn.fetch = AsyncMock(return_value=[
-            {"model_name": "gpt-4o", "temperature": 0.7, "max_tokens": 4096, "priority": 1},
-        ])
+        mock_conn.fetchrow = AsyncMock(side_effect=_make_mock_fetchrow("gpt-4o", None, 0.7, 4096))
 
         mock_llm = _make_mock_llm_client(should_raise=True)
 
@@ -529,9 +539,7 @@ class TestMakeGenerateContent:
 
         mock_pool = MagicMock()
         mock_conn = AsyncMock()
-        mock_conn.fetch = AsyncMock(return_value=[
-            {"model_name": "gpt-4o", "temperature": 0.7, "max_tokens": 4096, "priority": 1},
-        ])
+        mock_conn.fetchrow = AsyncMock(side_effect=_make_mock_fetchrow("gpt-4o", None, 0.7, 4096))
 
         mock_llm = _make_mock_llm_client(response_json, redes)
 
@@ -561,9 +569,7 @@ class TestMakeGenerateContent:
 
         mock_pool = MagicMock()
         mock_conn = AsyncMock()
-        mock_conn.fetch = AsyncMock(return_value=[
-            {"model_name": "gpt-4o", "temperature": 0.65, "max_tokens": 8192, "priority": 1},
-        ])
+        mock_conn.fetchrow = AsyncMock(side_effect=_make_mock_fetchrow("gpt-4o", None, 0.65, 8192))
 
         mock_llm = _make_mock_llm_client(response_json, redes)
 
@@ -594,9 +600,7 @@ class TestMakeGenerateContent:
         """Malformed LLM response that isn't JSON raises ValueError."""
         mock_pool = MagicMock()
         mock_conn = AsyncMock()
-        mock_conn.fetch = AsyncMock(return_value=[
-            {"model_name": "gpt-4o", "temperature": 0.7, "max_tokens": 4096, "priority": 1},
-        ])
+        mock_conn.fetchrow = AsyncMock(side_effect=_make_mock_fetchrow("gpt-4o", None, 0.7, 4096))
 
         # LLM returns non-JSON content
         async def bad_llm(*args):

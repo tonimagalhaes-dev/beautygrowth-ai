@@ -41,6 +41,7 @@ def mock_state_manager():
 def mock_workflow_engine():
     """Create a mocked workflow engine."""
     engine = MagicMock(spec=LangGraphWorkflowEngine)
+    engine._workflows = {}
     engine.register_workflow = MagicMock()
     engine.execute = AsyncMock()
     return engine

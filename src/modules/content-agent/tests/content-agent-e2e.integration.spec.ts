@@ -153,6 +153,7 @@ describe('ContentAgent E2E Integration', () => {
         forbidNonWhitelisted: false,
       }),
     );
+    app.setGlobalPrefix('api');
     await app.init();
 
     langGraphClient = moduleRef.get(LangGraphClientService);

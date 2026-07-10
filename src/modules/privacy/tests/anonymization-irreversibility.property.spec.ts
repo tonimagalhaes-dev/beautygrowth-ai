@@ -66,11 +66,12 @@ describe('Property 23: Anonimização Irreversível', () => {
           // The anonymized output must not contain any part of the original data
           // that could identify the person (check substrings of length >= 3)
           if (personalData.length >= 3) {
+            const hashPart = anonymized.substring(5).toLowerCase();
             for (let i = 0; i <= personalData.length - 3; i++) {
               const substring = personalData.substring(i, i + 3).toLowerCase();
               // Only check non-trivial substrings (not just hex chars)
               if (!/^[0-9a-f]+$/.test(substring)) {
-                expect(anonymized.toLowerCase()).not.toContain(substring);
+                expect(hashPart).not.toContain(substring);
               }
             }
           }

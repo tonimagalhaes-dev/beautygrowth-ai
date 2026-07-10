@@ -265,7 +265,7 @@ class TestResolveWorkflowErrors:
         _setup_connection(mock_pool, mock_connection)
 
         tenant_id = "550e8400-e29b-41d4-a716-446655440000"
-        agent_id = "nonexistent-agent-id"
+        agent_id = "550e8400-e29b-41d4-a716-446655440099"
 
         # No row found for agent_id
         mock_connection.fetchrow.return_value = None
@@ -274,7 +274,7 @@ class TestResolveWorkflowErrors:
             await router.resolve_workflow(agent_id, tenant_id)
 
         assert exc_info.value.agent_id == agent_id
-        assert "nonexistent-agent-id" in str(exc_info.value)
+        assert "550e8400-e29b-41d4-a716-446655440099" in str(exc_info.value)
 
     @pytest.mark.asyncio
     async def test_raises_workflow_not_found_error(
@@ -506,24 +506,15 @@ class TestUUIDValidation:
     """Test that invalid UUID agent_id is rejected early."""
 
     @pytest.mark.asyncio
-    async def test_invalid_uuid_raises_agent_not_found(self, router, mock_pool):
-        """Non-UUID agent_id should raise AgentNotFoundError before DB query."""
+    async def test_non_uuid_resolved_as_direct_workflow(self, router, mock_pool):
+        """Non-UUID agent_id should resolve directly as a workflow_id without hitting the DB."""
         tenant_id = "550e8400-e29b-41d4-a716-446655440000"
-        invalid_ids = [
-            "not-a-uuid",
-            "12345",
-            "",
-            "550e8400-e29b-41d4-a716",  # truncated
-            "gggggggg-gggg-gggg-gggg-gggggggggggg",  # invalid hex
-            "550e8400e29b41d4a716446655440000",  # no dashes
-        ]
+        non_uuid_ids = ["content", "campaigns", "another-workflow"]
 
-        for invalid_id in invalid_ids:
-            with pytest.raises(AgentNotFoundError) as exc_info:
-                await router.resolve_workflow(invalid_id, tenant_id)
-
-            assert exc_info.value.agent_id == invalid_id
-            assert "invalid UUID format" in str(exc_info.value)
+        for non_uuid_id in non_uuid_ids:
+            resolved = await router.resolve_workflow(non_uuid_id, tenant_id)
+            assert resolved.workflow_id == non_uuid_id
+            assert resolved.agent_type == non_uuid_id
 
         # Verify pool.acquire was never called (no DB hit)
         mock_pool.acquire.assert_not_called()
