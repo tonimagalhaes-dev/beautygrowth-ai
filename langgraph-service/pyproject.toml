@@ -17,6 +17,7 @@ dependencies = [
     "opentelemetry-sdk>=1.22.0",
     "opentelemetry-instrumentation-grpc>=0.43b0",
     "qdrant-client>=1.7.0",
+    "Pillow>=10.0.0",
 ]
 
 [project.optional-dependencies]

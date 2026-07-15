@@ -1,6 +1,6 @@
 """Main entry point for the LangGraph Orchestration Service.
 
-Initializes Redis client, asyncpg pool, creates core components
+Initializes Redis client, asyncpg pool, Qdrant client, creates core components
 (StateManager, WorkflowEngine, AgentRouter), and starts the gRPC server.
 
 Usage:
@@ -14,6 +14,7 @@ import sys
 
 import asyncpg
 import redis.asyncio as redis
+from qdrant_client import AsyncQdrantClient
 
 from .core.agent_router import PostgresAgentRouter
 from .core.llm_clients import GeminiLLMClient
@@ -26,6 +27,7 @@ from .grpc.interceptors import (
 )
 from .grpc.server import AgentOrchestrationServicer, serve
 from .workflows.content_agent import build_content_agent_graph
+from .workflows.designer_agent import build_designer_agent_graph
 
 # Configure logging
 logging.basicConfig(
@@ -34,6 +36,26 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 logger = logging.getLogger(__name__)
+
+
+async def _gemini_embed(text: str) -> list[float]:
+    """Simple embedding function using Gemini's text-embedding model.
+
+    Falls back to a zero vector if embedding fails (e.g., no Qdrant collection),
+    allowing the workflow to proceed without Knowledge Hub context.
+    """
+    import google.generativeai as genai
+
+    try:
+        result = genai.embed_content(
+            model="models/text-embedding-004",
+            content=text,
+        )
+        return result["embedding"]
+    except Exception as exc:
+        logger.warning("Embedding failed (will return empty chunks): %s", str(exc))
+        # Return a 768-dimensional zero vector as fallback
+        return [0.0] * 768
 
 
 async def main() -> None:
@@ -47,11 +69,15 @@ async def main() -> None:
     # PostgreSQL configuration
     pg_host = os.environ.get("POSTGRES_HOST", "localhost")
     pg_port = int(os.environ.get("POSTGRES_PORT", "5432"))
-    pg_database = os.environ.get("POSTGRES_DB", "beautygrowth")
-    pg_user = os.environ.get("POSTGRES_USER", "postgres")
-    pg_password = os.environ.get("POSTGRES_PASSWORD", "postgres")
+    pg_database = os.environ.get("POSTGRES_DB", "beautygrowth_dev")
+    pg_user = os.environ.get("POSTGRES_USER", "beautygrowth")
+    pg_password = os.environ.get("POSTGRES_PASSWORD", "beautygrowth_dev")
     pg_min_pool = int(os.environ.get("POSTGRES_POOL_MIN", "2"))
     pg_max_pool = int(os.environ.get("POSTGRES_POOL_MAX", "10"))
+
+    # Qdrant configuration
+    qdrant_host = os.environ.get("QDRANT_HOST", "qdrant")
+    qdrant_port = int(os.environ.get("QDRANT_PORT", "6333"))
 
     # Initialize Redis client
     logger.info("Connecting to Redis at %s", redis_url)
@@ -69,6 +95,10 @@ async def main() -> None:
         max_size=pg_max_pool,
     )
 
+    # Initialize Qdrant client
+    logger.info("Connecting to Qdrant at %s:%d", qdrant_host, qdrant_port)
+    qdrant_client = AsyncQdrantClient(host=qdrant_host, port=qdrant_port)
+
     # Create core components
     state_manager = RedisStateManager(
         redis_client=redis_client,
@@ -85,9 +115,24 @@ async def main() -> None:
     logger.info("LLM client initialized: GeminiLLMClient")
 
     # Register domain-specific workflows
-    content_agent_graph = build_content_agent_graph(pg_pool=pg_pool, llm_client=llm_client)
+    content_agent_graph = build_content_agent_graph(
+        pg_pool=pg_pool,
+        qdrant_client=qdrant_client,
+        embed_fn=_gemini_embed,
+        collection_name="knowledge_hub",
+        llm_client=llm_client,
+    )
     workflow_engine.register_workflow("content", content_agent_graph)
     logger.info("Registered workflow: content (Content Agent)")
+
+    designer_agent_graph = build_designer_agent_graph(
+        pg_pool=pg_pool,
+        qdrant_client=qdrant_client,
+        embed_fn=_gemini_embed,
+        collection_name="knowledge_hub",
+    )
+    workflow_engine.register_workflow("designer", designer_agent_graph)
+    logger.info("Registered workflow: designer (Designer Agent)")
 
     agent_router = PostgresAgentRouter(pool=pg_pool)
 
@@ -113,6 +158,7 @@ async def main() -> None:
     finally:
         # Cleanup
         logger.info("Cleaning up connections...")
+        await qdrant_client.close()
         await redis_client.aclose()
         await pg_pool.close()
         logger.info("Cleanup complete")

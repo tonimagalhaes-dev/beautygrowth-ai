@@ -51,6 +51,91 @@ MAX_WORKERS = 10
 
 
 # ============================================================
+# Initial State Builder — maps user_input to workflow-specific state
+# ============================================================
+
+
+def _build_initial_state_for_workflow(
+    resolved_workflow_id: str,
+    user_input: str,
+    tenant_id: str,
+    user_id: str,
+    agent_id: str,
+    conversation_id: str,
+    execution_id: str,
+    trace_id: str,
+) -> dict:
+    """Build the initial state for a workflow execution.
+
+    For the 'content' workflow, parses user_input JSON and builds
+    the ContentAgentState with the expected keys (briefing, execution_id, etc.).
+    For other workflows, uses the generic state format.
+    """
+    import json as _json
+
+    # Content Agent workflow: expects ContentAgentState schema
+    if resolved_workflow_id == "content":
+        try:
+            input_data = _json.loads(user_input) if user_input else {}
+        except _json.JSONDecodeError:
+            input_data = {}
+
+        return {
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "trace_id": trace_id,
+            "execution_id": input_data.get("execution_id", execution_id),
+            "briefing": {
+                "tema": input_data.get("tema", ""),
+                "procedimento": input_data.get("procedimento"),
+                "publico_alvo_override": input_data.get("publico_alvo_override"),
+                "redes_sociais": input_data.get("redes_sociais", []),
+                "idioma": input_data.get("idioma", "pt-BR"),
+            },
+            "is_refinement": input_data.get("is_refinement", False),
+            "original_execution_id": input_data.get("original_execution_id"),
+            "refinement_instructions": input_data.get("instrucoes"),
+            "version": input_data.get("version", 1),
+            # Context fields (populated by load_context)
+            "brand_identity": {},
+            "publico_alvo": "",
+            "especialidades": [],
+            "diferenciais": [],
+            "knowledge_chunks": [],
+            # Prompt fields (populated by resolve_prompt)
+            "system_prompt": "",
+            "task_prompt": "",
+            # Generation fields (populated by generate_content)
+            "legendas": {},
+            "hashtags": [],
+            "sugestoes_visuais": {},
+            "model_id": "",
+            "used_fallback": False,
+            # Validation fields
+            "guardrail_attempt": 0,
+            "guardrail_violations": [],
+            "blocked_reason": None,
+            # Execution metadata
+            "steps": [],
+            "tokens_input": 0,
+            "tokens_output": 0,
+            "output": "",
+        }
+
+    # Generic workflow state
+    return {
+        "user_input": user_input,
+        "tenant_id": tenant_id,
+        "agent_id": agent_id,
+        "conversation_id": conversation_id,
+        "messages": [],
+        "intermediate_results": {},
+        "output": "",
+        "steps": [],
+    }
+
+
+# ============================================================
 # Response dataclasses (map to protobuf messages)
 # ============================================================
 
@@ -219,16 +304,16 @@ class AgentOrchestrationServicer:
 
 
             # Step 4: Create initial state via State Manager
-            initial_state = {
-                "user_input": user_input,
-                "tenant_id": tenant_id,
-                "agent_id": agent_id,
-                "conversation_id": conversation_id,
-                "messages": [],
-                "intermediate_results": {},
-                "output": "",
-                "steps": [],
-            }
+            initial_state = _build_initial_state_for_workflow(
+                resolved_workflow_id=resolved_workflow_id,
+                user_input=user_input,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                agent_id=agent_id,
+                conversation_id=conversation_id,
+                execution_id=execution_id,
+                trace_id=trace_id,
+            )
 
             await self._state_manager.create_state(
                 execution_id=execution_id,
@@ -494,16 +579,16 @@ class AgentOrchestrationServicer:
 
 
             # Step 4: Create initial state via State Manager
-            initial_state = {
-                "user_input": user_input,
-                "tenant_id": tenant_id,
-                "agent_id": agent_id,
-                "conversation_id": conversation_id,
-                "messages": [],
-                "intermediate_results": {},
-                "output": "",
-                "steps": [],
-            }
+            initial_state = _build_initial_state_for_workflow(
+                resolved_workflow_id=resolved_workflow_id,
+                user_input=user_input,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                agent_id=agent_id,
+                conversation_id=conversation_id,
+                execution_id=execution_id,
+                trace_id=trace_id,
+            )
 
             await self._state_manager.create_state(
                 execution_id=execution_id,
