@@ -16,6 +16,7 @@ import { ObservabilityModule } from './modules/observability/observability.modul
 import { IntegrationModule } from './modules/integration/integration.module';
 import { AgentExecutionModule } from './modules/agent-execution/agent-execution.module';
 import { ContentAgentModule } from './modules/content-agent/content-agent.module';
+import { DesignerAgentModule } from './modules/designer-agent/designer-agent.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { EventBusModule } from './modules/event-bus/event-bus.module';
 import { CacheModule } from './modules/cache/cache.module';
@@ -55,6 +56,7 @@ import { CacheModule } from './modules/cache/cache.module';
     IntegrationModule,
     AgentExecutionModule,
     ContentAgentModule,
+    DesignerAgentModule,
     AuthModule,
   ],
   controllers: [AppController],

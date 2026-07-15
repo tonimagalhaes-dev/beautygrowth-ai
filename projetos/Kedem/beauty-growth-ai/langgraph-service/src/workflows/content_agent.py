@@ -166,7 +166,7 @@ async def _load_business_memory(
         SELECT category, key, value
         FROM business_memory_entries
         WHERE category IN (
-            'brand_identity', 'publico_alvo', 'especialidades', 'diferenciais'
+            'brand', 'audience', 'procedures', 'preferences'
         )
         """,
     )
@@ -176,6 +176,7 @@ async def _load_business_memory(
         "valores": None,
         "paleta_cores": None,
         "publico_alvo": None,
+        "nome_clinica": None,
         "especialidades": [],
         "diferenciais": [],
     }
@@ -185,19 +186,29 @@ async def _load_business_memory(
         key = row["key"]
         value = row["value"]
 
-        if category == "brand_identity":
-            if key == "tom_de_voz":
+        if category == "brand":
+            if key in ("tom_de_voz", "voice_tone"):
                 result["tom_de_voz"] = value
-            elif key == "valores":
+            elif key in ("valores", "values"):
                 result["valores"] = value
-            elif key == "paleta_cores":
+            elif key in ("paleta_cores", "color_palette"):
                 result["paleta_cores"] = value
-        elif category == "publico_alvo":
-            result["publico_alvo"] = value
-        elif category == "especialidades":
-            result["especialidades"].append(value)
-        elif category == "diferenciais":
-            result["diferenciais"].append(value)
+            elif key in ("diferenciais", "differentials"):
+                if isinstance(value, list):
+                    result["diferenciais"].extend(value)
+                else:
+                    result["diferenciais"].append(value)
+            elif key in ("nome_clinica", "clinic_name"):
+                result["nome_clinica"] = value
+        elif category == "audience":
+            if key in ("publico_alvo", "clinic_target_audience"):
+                result["publico_alvo"] = value
+        elif category == "procedures":
+            if key in ("especialidades", "specialties"):
+                if isinstance(value, list):
+                    result["especialidades"].extend(value)
+                else:
+                    result["especialidades"].append(value)
 
     return result
 
@@ -391,12 +402,14 @@ def make_load_context(
                 top_k=5,
             )
         except Exception as exc:
-            logger.error(
-                "Failed to search Knowledge Hub: tenant_id=%s, error=%s",
+            logger.warning(
+                "Knowledge Hub search failed (proceeding without context): "
+                "tenant_id=%s, error=%s",
                 tenant_id,
                 str(exc),
             )
-            raise ContextLoadError("knowledge_hub", tenant_id, str(exc)) from exc
+            # Graceful degradation: continue without Knowledge Hub context
+            knowledge_chunks = []
 
         # 4. If refinement: load original execution from Agent Memory
         if state.get("is_refinement") and state.get("original_execution_id"):
@@ -443,6 +456,7 @@ def make_load_context(
             "tom_de_voz": bm_data["tom_de_voz"],
             "valores": bm_data.get("valores"),
             "paleta_cores": bm_data.get("paleta_cores"),
+            "nome_clinica": bm_data.get("nome_clinica", ""),
         }
 
         return {
@@ -1251,22 +1265,32 @@ def make_persist_and_output(
         # 2. Persist to Agent Memory (short-term)
         try:
             async with tenant_connection(pg_pool, tenant_id) as conn:
-                await conn.execute(
-                    """
-                    INSERT INTO agent_memory_short
-                        (agent_id, tenant_id, role, content, metadata)
-                    VALUES ($1, $2::uuid, $3, $4, $5::jsonb)
-                    """,
-                    "content",
-                    tenant_id,
-                    "assistant",
-                    output_json,
-                    json.dumps({
-                        "execution_id": execution_id,
-                        "version": version,
-                        "trace_id": trace_id,
-                    }),
+                # Lookup agent_config_id for agent_type='content'
+                agent_config_row = await conn.fetchrow(
+                    "SELECT id FROM agent_configs WHERE agent_type = 'content' AND status = 'active' LIMIT 1",
                 )
+                if agent_config_row:
+                    await conn.execute(
+                        """
+                        INSERT INTO agent_memory_short
+                            (agent_id, tenant_id, role, content, metadata)
+                        VALUES ($1::uuid, $2::uuid, $3, $4, $5::jsonb)
+                        """,
+                        str(agent_config_row["id"]),
+                        tenant_id,
+                        "assistant",
+                        output_json,
+                        json.dumps({
+                            "execution_id": execution_id,
+                            "version": version,
+                            "trace_id": trace_id,
+                        }),
+                    )
+                else:
+                    logger.warning(
+                        "No active agent_config found for content agent, "
+                        "skipping agent_memory_short persistence"
+                    )
         except Exception as exc:
             # Requirement 6.5: If persistence fails, return content normally + warning log
             logger.warning(
