@@ -9,6 +9,7 @@ dependencies = [
     "langgraph>=0.2.0",
     "langchain-core>=0.3.0",
     "google-generativeai>=0.8.0",
+    "google-genai>=1.0.0",
     "grpcio>=1.60.0",
     "grpcio-tools>=1.60.0",
     "redis[hiredis]>=5.0.0",
@@ -18,6 +19,7 @@ dependencies = [
     "opentelemetry-instrumentation-grpc>=0.43b0",
     "qdrant-client>=1.7.0",
     "Pillow>=10.0.0",
+    "minio>=7.2.0",
 ]
 
 [project.optional-dependencies]

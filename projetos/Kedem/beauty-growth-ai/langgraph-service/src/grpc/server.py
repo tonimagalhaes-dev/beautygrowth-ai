@@ -122,6 +122,75 @@ def _build_initial_state_for_workflow(
             "output": "",
         }
 
+    # Designer Agent workflow: expects DesignerAgentState schema
+    if resolved_workflow_id == "designer":
+        try:
+            input_data = _json.loads(user_input) if user_input else {}
+        except _json.JSONDecodeError:
+            input_data = {}
+
+        # Extract metadata from options (passed by NestJS)
+        metadata = input_data if isinstance(input_data, dict) else {}
+
+        # Parse redes_sociais from comma-separated string or list
+        redes_raw = metadata.get("redes_sociais", [])
+        if isinstance(redes_raw, str):
+            redes_sociais = [r.strip() for r in redes_raw.split(",") if r.strip()]
+        elif isinstance(redes_raw, list):
+            redes_sociais = redes_raw
+        else:
+            redes_sociais = []
+
+        return {
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "trace_id": trace_id,
+            "execution_id": metadata.get("execution_id", execution_id),
+            "request": {
+                "descricao_visual": metadata.get("descricao_visual", user_input or ""),
+                "redes_sociais": redes_sociais,
+                "content_execution_id": metadata.get("content_execution_id"),
+                "aplicar_logo_overlay": metadata.get("aplicar_logo_overlay", "false").lower() == "true" if isinstance(metadata.get("aplicar_logo_overlay"), str) else bool(metadata.get("aplicar_logo_overlay", False)),
+                "estilo_visual_adicional": metadata.get("estilo_visual_adicional") or None,
+            },
+            "is_edit": metadata.get("is_edit", "false").lower() == "true" if isinstance(metadata.get("is_edit"), str) else bool(metadata.get("is_edit", False)),
+            "original_execution_id": metadata.get("original_execution_id"),
+            "edit_instruction": metadata.get("edit_instruction"),
+            "target_social": metadata.get("target_social"),
+            "version": int(metadata.get("version", 1)),
+            # Context fields (populated by load_context)
+            "brand_identity": {},
+            "brand_identity_defaults_used": False,
+            "clinic_logo_url": None,
+            "content_agent_data": None,
+            "knowledge_chunks": [],
+            "edit_history": [],
+            # Prompt fields (populated by build_visual_prompt)
+            "visual_prompts": {},
+            "negative_prompts": [],
+            # Guardrails
+            "guardrail_attempt": 0,
+            "guardrail_violations": [],
+            # Generation fields
+            "generated_images": {},
+            "generation_errors": {},
+            "model_id": "",
+            "used_fallback": False,
+            # Post-processing
+            "processed_images": {},
+            "logo_overlay_applied": False,
+            "logo_overlay_warnings": [],
+            # Upload
+            "image_urls": {},
+            "image_metadata": [],
+            # Execution metadata
+            "steps": [],
+            "tokens_consumed": 0,
+            "duration_ms": 0,
+            "warnings": [],
+            "output": "",
+        }
+
     # Generic workflow state
     return {
         "user_input": user_input,

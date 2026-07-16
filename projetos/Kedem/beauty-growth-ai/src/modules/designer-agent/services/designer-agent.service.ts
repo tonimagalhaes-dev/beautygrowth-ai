@@ -57,7 +57,7 @@ export class DesignerAgentService {
   private readonly bucket: string;
 
   /** Agent ID for the designer agent in the agent router */
-  private static readonly DESIGNER_AGENT_ID = 'designer-agent';
+  private static readonly DESIGNER_AGENT_ID = 'designer';
 
   /** Maximum number of edits allowed per social network */
   private static readonly MAX_EDITS_PER_SOCIAL = 5;
@@ -78,8 +78,10 @@ export class DesignerAgentService {
     this.bucket = this.configService.get<string>('S3_BUCKET', 'beauty-growth-ai');
     const endpoint = this.configService.get<string>('S3_ENDPOINT', 'http://localhost:9000');
     const region = this.configService.get<string>('S3_REGION', 'us-east-1');
-    const accessKeyId = this.configService.get<string>('S3_ACCESS_KEY_ID', 'minioadmin');
-    const secretAccessKey = this.configService.get<string>('S3_SECRET_ACCESS_KEY', 'minioadmin');
+    const accessKeyId = this.configService.get<string>('S3_ACCESS_KEY_ID', '') 
+      || this.configService.get<string>('S3_ACCESS_KEY', 'beautygrowth');
+    const secretAccessKey = this.configService.get<string>('S3_SECRET_ACCESS_KEY', '')
+      || this.configService.get<string>('S3_SECRET_KEY', 'beautygrowth_dev');
 
     this.s3Client = new S3Client({
       region,
@@ -167,7 +169,7 @@ export class DesignerAgentService {
       userId,
       userInput: dto.instrucaoEdicao,
       tenantContext: {},
-      workflowId: 'designer-agent',
+      workflowId: 'designer',
       conversationId: dto.executionId,
       options: {
         maxSteps: 10,
@@ -320,7 +322,7 @@ export class DesignerAgentService {
       redesSociais: validSuggestions,
       estiloVisualAdicional: dto.estiloVisualAdicional || null,
       aplicarLogoOverlay: dto.aplicarLogoOverlay ?? false,
-      traceId: resolvedTraceId,
+      traceId: resolvedTraceId.replace(/^trace-/, ''),
     });
 
     await this.executionRepository.save(execution);
@@ -330,9 +332,16 @@ export class DesignerAgentService {
       agentId: DesignerAgentService.DESIGNER_AGENT_ID,
       tenantId,
       userId,
-      userInput: descricaoVisual,
+      userInput: JSON.stringify({
+        execution_id: executionId,
+        descricao_visual: descricaoVisual,
+        redes_sociais: validSuggestions,
+        content_execution_id: dto.contentExecutionId,
+        aplicar_logo_overlay: dto.aplicarLogoOverlay ?? false,
+        estilo_visual_adicional: dto.estiloVisualAdicional || '',
+      }),
       tenantContext: {},
-      workflowId: 'designer-agent',
+      workflowId: 'designer',
       conversationId: executionId,
       options: {
         maxSteps: 10,
@@ -341,10 +350,6 @@ export class DesignerAgentService {
         metadata: {
           execution_id: executionId,
           trace_id: resolvedTraceId,
-          content_execution_id: dto.contentExecutionId,
-          redes_sociais: validSuggestions.join(','),
-          aplicar_logo_overlay: String(dto.aplicarLogoOverlay ?? false),
-          estilo_visual_adicional: dto.estiloVisualAdicional || '',
           workflow_type: 'from_content',
         },
       },
@@ -369,6 +374,11 @@ export class DesignerAgentService {
           );
         },
       )
+      .then((response) => {
+        this.logger.log(
+          `[${resolvedTraceId}] Workflow completed for execution=${executionId}, success=${response?.success}`,
+        );
+      })
       .catch((error) => {
         this.logger.error(
           `[${resolvedTraceId}] Async workflow dispatch failed for execution=${executionId}: ${error instanceof Error ? error.message : String(error)}`,
@@ -387,9 +397,12 @@ export class DesignerAgentService {
   }
 
   /**
-   * Loads a Content Agent execution from Agent Memory.
+   * Loads a Content Agent execution from the workflow_executions table.
    * Returns the execution data with status and visual suggestions if found and belongs to tenant.
    * Returns null if not found or belongs to another tenant.
+   *
+   * Queries by conversation_id (the Content Agent's executionId) which corresponds
+   * to the contentExecutionId passed from the frontend.
    *
    * Applies a 5-second timeout to ensure SLA compliance (Requirement 9.1).
    */
@@ -401,56 +414,53 @@ export class DesignerAgentService {
     sugestoesVisuais: Record<string, { formato?: string; descricao: string }>;
     redesSociais?: string[];
   } | null> {
-    const CONTENT_AGENT_ID = 'content';
     const TIMEOUT_MS = 5000;
 
     try {
-      const memoryPromise = this.agentMemoryService.getShortTermMemory(
-        CONTENT_AGENT_ID,
-        tenantId,
+      const queryPromise = this.executionRepository.manager.query(
+        `SELECT id, tenant_id, workflow_id, status, output
+         FROM workflow_executions
+         WHERE conversation_id = $1
+           AND tenant_id = $2
+           AND workflow_id IN ('content', 'content_agent')
+         ORDER BY created_at DESC
+         LIMIT 1`,
+        [contentExecutionId, tenantId],
       );
 
       // Apply 5-second timeout
-      const shortTermMemory = await Promise.race([
-        memoryPromise,
+      const rows = await Promise.race([
+        queryPromise,
         new Promise<never>((_, reject) =>
           setTimeout(() => reject(new Error('Timeout loading content execution')), TIMEOUT_MS),
         ),
       ]);
 
-      // Find interactions related to this content execution_id
-      const executionInteractions = shortTermMemory.filter(
-        (interaction) =>
-          interaction.metadata?.execution_id === contentExecutionId &&
-          interaction.role === 'assistant',
-      );
-
-      if (executionInteractions.length === 0) {
+      if (!rows || rows.length === 0) {
         return null;
       }
 
-      // Get the most recent interaction (highest version or latest timestamp)
-      const latestInteraction = executionInteractions.reduce((latest, current) => {
-        const latestVersion = latest.metadata?.version ?? 1;
-        const currentVersion = current.metadata?.version ?? 1;
-        return currentVersion > latestVersion ? current : latest;
-      });
+      const row = rows[0];
+      const dbStatus = row.status;
 
-      // Parse the content to extract sugestoesVisuais and status
-      let parsedContent: any;
-      try {
-        parsedContent = JSON.parse(latestInteraction.content);
-      } catch {
-        // If content is not JSON, try to get data from metadata
-        parsedContent = latestInteraction.metadata || {};
+      // Map DB status to content status
+      const status = dbStatus === 'completed' || dbStatus === 'success' ? 'draft' : dbStatus;
+
+      // Parse output JSON to extract visual suggestions
+      let parsedOutput: any = {};
+      if (row.output) {
+        try {
+          parsedOutput = typeof row.output === 'string' ? JSON.parse(row.output) : row.output;
+        } catch {
+          return null;
+        }
       }
 
-      const status = parsedContent.status || latestInteraction.metadata?.status || 'draft';
-      const sugestoesVisuais = parsedContent.sugestoes_visuais
-        || parsedContent.sugestoesVisuais
+      const sugestoesVisuais = parsedOutput.sugestoes_visuais
+        || parsedOutput.sugestoesVisuais
         || {};
-      const redesSociais = parsedContent.redes_sociais
-        || parsedContent.redesSociais
+      const redesSociais = parsedOutput.redes_sociais
+        || parsedOutput.redesSociais
         || Object.keys(sugestoesVisuais);
 
       return {

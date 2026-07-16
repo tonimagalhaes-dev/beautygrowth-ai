@@ -14,7 +14,7 @@ export type RedeSocial = 'instagram' | 'facebook' | 'tiktok';
 export class GenerateBriefingDto {
   @IsString()
   @IsNotEmpty({ message: 'O campo tema é obrigatório' })
-  @MaxLength(500, { message: 'O campo tema deve ter no máximo 500 caracteres' })
+  @MaxLength(2000, { message: 'O campo tema deve ter no máximo 2000 caracteres' })
   tema: string;
 
   @IsOptional()
