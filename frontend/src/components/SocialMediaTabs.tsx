@@ -1,4 +1,5 @@
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { CopyButton } from '@/components/CopyButton';
 
 interface SocialMediaTabsProps {
   legendas: Record<string, string>;
@@ -33,9 +34,17 @@ export function SocialMediaTabs({ legendas }: SocialMediaTabsProps) {
 
       {redes.map((rede) => (
         <TabsContent key={rede} value={rede}>
-          <p className="whitespace-pre-wrap text-sm text-foreground leading-relaxed">
-            {legendas[rede]}
-          </p>
+          <div className="relative group">
+            <div className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 transition-opacity">
+              <CopyButton
+                text={legendas[rede]}
+                ariaLabel={`Copiar legenda para ${getRedeLabel(rede)}`}
+              />
+            </div>
+            <p className="whitespace-pre-wrap text-sm text-foreground leading-relaxed pr-8">
+              {legendas[rede]}
+            </p>
+          </div>
         </TabsContent>
       ))}
     </Tabs>

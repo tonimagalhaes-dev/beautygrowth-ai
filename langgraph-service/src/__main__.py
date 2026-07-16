@@ -18,6 +18,7 @@ from qdrant_client import AsyncQdrantClient
 
 from .core.agent_router import PostgresAgentRouter
 from .core.llm_clients import GeminiLLMClient
+from .core.image_clients import GeminiImageClient
 from .core.state_manager import RedisStateManager
 from .core.workflow_engine import LangGraphWorkflowEngine
 from .grpc.interceptors import (
@@ -25,6 +26,7 @@ from .grpc.interceptors import (
     PostgresAuditLogStore,
     TenantValidationInterceptor,
 )
+from .core.storage_client import MinioStorageClient, MinioLogoDownloader
 from .grpc.server import AgentOrchestrationServicer, serve
 from .workflows.content_agent import build_content_agent_graph
 from .workflows.designer_agent import build_designer_agent_graph
@@ -125,11 +127,31 @@ async def main() -> None:
     workflow_engine.register_workflow("content", content_agent_graph)
     logger.info("Registered workflow: content (Content Agent)")
 
+    # Initialize MinIO storage client for Designer Agent uploads
+    minio_endpoint = os.environ.get("MINIO_ENDPOINT", "minio:9000")
+    minio_access_key = os.environ.get("MINIO_ACCESS_KEY", "beautygrowth")
+    minio_secret_key = os.environ.get("MINIO_SECRET_KEY", "beautygrowth_dev")
+    minio_bucket = os.environ.get("MINIO_BUCKET", "beauty-growth-ai")
+    minio_secure = os.environ.get("MINIO_SECURE", "false").lower() == "true"
+
+    storage_client = MinioStorageClient(
+        endpoint=minio_endpoint,
+        access_key=minio_access_key,
+        secret_key=minio_secret_key,
+        bucket=minio_bucket,
+        secure=minio_secure,
+    )
+    logo_downloader = MinioLogoDownloader(storage_client)
+    logger.info("MinIO storage client initialized: endpoint=%s, bucket=%s", minio_endpoint, minio_bucket)
+
     designer_agent_graph = build_designer_agent_graph(
         pg_pool=pg_pool,
         qdrant_client=qdrant_client,
         embed_fn=_gemini_embed,
         collection_name="knowledge_hub",
+        image_client=GeminiImageClient(),
+        logo_downloader=logo_downloader,
+        storage_client=storage_client,
     )
     workflow_engine.register_workflow("designer", designer_agent_graph)
     logger.info("Registered workflow: designer (Designer Agent)")

@@ -653,7 +653,7 @@ def _resolve_content_agent_status(
         return metadata["content_status"]
 
     # Map DB-level statuses to content-level statuses
-    if db_status == "completed":
+    if db_status in ("completed", "success"):
         if blocked_reason and not blocked_reason.startswith("persisted due to"):
             return "guardrail_blocked"
         return "draft"
@@ -709,8 +709,10 @@ async def _load_content_agent_data(
         SELECT id, tenant_id, workflow_id, status, output,
                blocked_reason, metadata
         FROM workflow_executions
-        WHERE id = $1
-          AND workflow_id = 'content_agent'
+        WHERE conversation_id = $1
+          AND workflow_id IN ('content', 'content_agent')
+        ORDER BY created_at DESC
+        LIMIT 1
         """,
         content_execution_id,
     )

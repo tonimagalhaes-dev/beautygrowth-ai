@@ -5,6 +5,7 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card';
+import { CopyButton } from '@/components/CopyButton';
 
 interface SugestaoVisualItem {
   formato: string;
@@ -29,9 +30,15 @@ export function VisualSuggestionCard({ sugestoes }: VisualSuggestionCardProps) {
   return (
     <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
       {redes.map(([rede, sugestao]) => (
-        <Card key={rede} className="hover:shadow-md">
+        <Card key={rede} className="hover:shadow-md overflow-visible">
           <CardHeader className="pb-3">
-            <CardTitle className="text-sm font-medium">{capitalizeRedeSocial(rede)}</CardTitle>
+            <div className="flex items-center justify-between">
+              <CardTitle className="text-sm font-medium">{capitalizeRedeSocial(rede)}</CardTitle>
+              <CopyButton
+                text={sugestao.descricao}
+                ariaLabel={`Copiar descrição visual para ${rede}`}
+              />
+            </div>
             <CardDescription className="text-xs">Sugestão visual</CardDescription>
           </CardHeader>
           <CardContent>
@@ -43,7 +50,7 @@ export function VisualSuggestionCard({ sugestoes }: VisualSuggestionCardProps) {
                 formato
               </span>
             </div>
-            <p className="text-sm text-muted-foreground">{sugestao.descricao}</p>
+            <p className="text-sm text-muted-foreground whitespace-pre-wrap break-words">{sugestao.descricao}</p>
           </CardContent>
         </Card>
       ))}

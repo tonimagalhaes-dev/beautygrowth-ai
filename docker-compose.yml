@@ -79,6 +79,11 @@ services:
       POSTGRES_PASSWORD: beautygrowth_dev
       QDRANT_HOST: qdrant
       QDRANT_PORT: '6333'
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: beautygrowth
+      MINIO_SECRET_KEY: beautygrowth_dev
+      MINIO_BUCKET: beauty-growth-ai
+      MINIO_SECURE: 'false'
       LOG_LEVEL: info
       SERVICE_VERSION: 0.1.0
       GOOGLE_API_KEY: ${GOOGLE_API_KEY}
@@ -90,6 +95,8 @@ services:
       redis:
         condition: service_healthy
       qdrant:
+        condition: service_healthy
+      minio:
         condition: service_healthy
     healthcheck:
       test: ['CMD', 'python', '-c', 'import socket; s=socket.socket(); s.settimeout(2); s.connect(("localhost", 50051)); s.close()']
