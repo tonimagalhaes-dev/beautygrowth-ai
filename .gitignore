@@ -41,3 +41,15 @@ lerna-debug.log*
 
 # Docker volumes (local)
 docker-data/
+
+# Python virtual enviroments
+.venv/
+**/.venv/
+venv/
+**/venv/
+
+# Python cache
+__pycache--/
+*.pyc
+
+
