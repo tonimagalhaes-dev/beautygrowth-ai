@@ -4,6 +4,7 @@ import { AuthModule } from '../auth/auth.module';
 import { AgentExecutionModule } from '../agent-execution/agent-execution.module';
 import { AgentMemoryModule } from '../agent-memory/agent-memory.module';
 import { ObservabilityModule } from '../observability/observability.module';
+import { PromptCacheModule } from '../prompt-cache/prompt-cache.module';
 
 import { ContentAgentController } from './content-agent.controller';
 import { ContentAgentService } from './services/content-agent.service';
@@ -17,11 +18,12 @@ import { ContentAgentService } from './services/content-agent.service';
  * - AgentExecutionModule: provides LangGraphClientService (gRPC) and CircuitBreakerService
  * - AgentMemoryModule: provides AgentMemoryService for refinement tracking
  * - ObservabilityModule: provides ObservabilityService for trace_id generation
+ * - PromptCacheModule: provides PromptCacheService for prompt/response caching
  *
  * Requirements: 1.1
  */
 @Module({
-  imports: [AuthModule, AgentExecutionModule, AgentMemoryModule, ObservabilityModule],
+  imports: [AuthModule, AgentExecutionModule, AgentMemoryModule, ObservabilityModule, PromptCacheModule],
   controllers: [ContentAgentController],
   providers: [ContentAgentService],
   exports: [ContentAgentService],

@@ -8,6 +8,7 @@ import { LangGraphClientService } from '../../agent-execution/services/langgraph
 import { CircuitBreakerService } from '../../agent-execution/services/circuit-breaker.service';
 import { AgentMemoryService } from '../../agent-memory/services/agent-memory.service';
 import { ObservabilityService } from '../../observability/services/observability.service';
+import { PromptCacheService } from '../../prompt-cache/services/prompt-cache.service';
 import { TenantGuard } from '@shared/guards/tenant.guard';
 import { ExecuteWorkflowResponse, ExecutionStatus } from '../../agent-execution/interfaces/grpc-types';
 
@@ -26,6 +27,7 @@ describe('ContentAgent E2E Integration', () => {
   let circuitBreaker: jest.Mocked<CircuitBreakerService>;
   let agentMemoryService: jest.Mocked<AgentMemoryService>;
   let observabilityService: jest.Mocked<ObservabilityService>;
+  let promptCacheService: jest.Mocked<PromptCacheService>;
 
   // =========================================================================
   // FIXTURES
@@ -128,6 +130,14 @@ describe('ContentAgent E2E Integration', () => {
             logAgentAction: jest.fn(),
           },
         },
+        {
+          provide: PromptCacheService,
+          useValue: {
+            checkCacheOrGenerate: jest.fn().mockResolvedValue({ type: 'miss' }),
+            persistCacheEntry: jest.fn().mockResolvedValue(undefined),
+            associateImages: jest.fn().mockResolvedValue(undefined),
+          },
+        },
       ],
     })
       // Override the TenantGuard to inject a deterministic tenant context
@@ -160,6 +170,7 @@ describe('ContentAgent E2E Integration', () => {
     circuitBreaker = moduleRef.get(CircuitBreakerService);
     agentMemoryService = moduleRef.get(AgentMemoryService);
     observabilityService = moduleRef.get(ObservabilityService);
+    promptCacheService = moduleRef.get(PromptCacheService);
   });
 
   afterEach(async () => {

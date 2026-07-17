@@ -329,7 +329,7 @@ Implementação da fundação da plataforma multi-agente BeautyGrowth AI usando 
     - **Validates: Requirements 13.6**
 
 - [x] 17. Integration wiring and end-to-end flows
-  - [-] 17.1 Wire tenant provisioning flow (registration → tenant → default agents → empty knowledge hub → memory)
+  - [x] 17.1 Wire tenant provisioning flow (registration → tenant → default agents → empty knowledge hub → memory)
     - Connect Auth registration to automatic tenant creation
     - Trigger default agent provisioning on new tenant
     - Initialize empty Knowledge Hub and Business Memory for new tenant

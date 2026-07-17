@@ -1,10 +1,4 @@
-import {
-  Injectable,
-  Logger,
-  NotFoundException,
-  HttpException,
-  HttpStatus,
-} from '@nestjs/common';
+import { Injectable, Logger, NotFoundException, HttpException, HttpStatus } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
@@ -16,6 +10,7 @@ import { LangGraphClientService } from '../../agent-execution/services/langgraph
 import { CircuitBreakerService } from '../../agent-execution/services/circuit-breaker.service';
 import { AgentMemoryService } from '../../agent-memory/services/agent-memory.service';
 import { ObservabilityService } from '../../observability/services/observability.service';
+import { PromptCacheService } from '../../prompt-cache/services/prompt-cache.service';
 
 import {
   GenerateImageDto,
@@ -68,6 +63,7 @@ export class DesignerAgentService {
     private readonly agentMemoryService: AgentMemoryService,
     private readonly observabilityService: ObservabilityService,
     private readonly configService: ConfigService,
+    private readonly promptCacheService: PromptCacheService,
     @InjectRepository(DesignerExecution)
     private readonly executionRepository: Repository<DesignerExecution>,
     @InjectRepository(DesignerImage)
@@ -78,10 +74,12 @@ export class DesignerAgentService {
     this.bucket = this.configService.get<string>('S3_BUCKET', 'beauty-growth-ai');
     const endpoint = this.configService.get<string>('S3_ENDPOINT', 'http://localhost:9000');
     const region = this.configService.get<string>('S3_REGION', 'us-east-1');
-    const accessKeyId = this.configService.get<string>('S3_ACCESS_KEY_ID', '') 
-      || this.configService.get<string>('S3_ACCESS_KEY', 'beautygrowth');
-    const secretAccessKey = this.configService.get<string>('S3_SECRET_ACCESS_KEY', '')
-      || this.configService.get<string>('S3_SECRET_KEY', 'beautygrowth_dev');
+    const accessKeyId =
+      this.configService.get<string>('S3_ACCESS_KEY_ID', '') ||
+      this.configService.get<string>('S3_ACCESS_KEY', 'beautygrowth');
+    const secretAccessKey =
+      this.configService.get<string>('S3_SECRET_ACCESS_KEY', '') ||
+      this.configService.get<string>('S3_SECRET_KEY', 'beautygrowth_dev');
 
     this.s3Client = new S3Client({
       region,
@@ -142,9 +140,7 @@ export class DesignerAgentService {
     });
 
     if (!execution) {
-      throw new NotFoundException(
-        'Execução não encontrada',
-      );
+      throw new NotFoundException('Execução não encontrada');
     }
 
     // 2. Count existing edits in designer_edit_history for (execution_id, rede_social)
@@ -223,7 +219,8 @@ export class DesignerAgentService {
       images,
       modeloUtilizado: grpcResponse.modelId || output.modelo_utilizado || '',
       usouFallback: grpcResponse.usedFallback || false,
-      tokensConsumidos: (grpcResponse.tokensUsed?.inputTokens || 0) + (grpcResponse.tokensUsed?.outputTokens || 0),
+      tokensConsumidos:
+        (grpcResponse.tokensUsed?.inputTokens || 0) + (grpcResponse.tokensUsed?.outputTokens || 0),
       duracaoMs: grpcResponse.durationMs || 0,
       version: output.version || execution.version + 1,
       logoOverlayAplicado: output.logo_overlay_aplicado || execution.logoOverlayAplicado || false,
@@ -261,17 +258,11 @@ export class DesignerAgentService {
     );
 
     // 1. Load Content Agent execution data from Agent Memory (5s timeout)
-    const contentData = await this.loadContentAgentExecution(
-      dto.contentExecutionId,
-      tenantId,
-    );
+    const contentData = await this.loadContentAgentExecution(dto.contentExecutionId, tenantId);
 
     // 2. Validate existence and tenant ownership (returns null if not found or wrong tenant)
     if (!contentData) {
-      throw new HttpException(
-        'Execução de conteúdo não encontrada',
-        HttpStatus.NOT_FOUND,
-      );
+      throw new HttpException('Execução de conteúdo não encontrada', HttpStatus.NOT_FOUND);
     }
 
     // 3. Validate status is 'draft' or 'approved'
@@ -378,15 +369,24 @@ export class DesignerAgentService {
         this.logger.log(
           `[${resolvedTraceId}] Workflow completed for execution=${executionId}, success=${response?.success}`,
         );
+
+        // Associate generated images with prompt cache entry (non-blocking)
+        this.associateImagesWithCache(executionId, dto.contentExecutionId, tenantId).catch(
+          (err) => {
+            this.logger.warn(
+              `[${resolvedTraceId}] Failed to associate images with cache for execution=${executionId}: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          },
+        );
       })
       .catch((error) => {
         this.logger.error(
           `[${resolvedTraceId}] Async workflow dispatch failed for execution=${executionId}: ${error instanceof Error ? error.message : String(error)}`,
         );
         // Update execution status to error (best-effort)
-        this.executionRepository
-          .update({ executionId }, { status: 'error' })
-          .catch(() => { /* ignore update failure */ });
+        this.executionRepository.update({ executionId }, { status: 'error' }).catch(() => {
+          /* ignore update failure */
+        });
       });
 
     // 8. Return 202 with processing status
@@ -394,6 +394,54 @@ export class DesignerAgentService {
       executionId,
       status: 'processing',
     };
+  }
+
+  /**
+   * Associates generated images with the prompt cache entry after workflow completion.
+   * Queries the designer_images table for the given designer executionId,
+   * then calls PromptCacheService.associateImages() with the contentExecutionId.
+   *
+   * This is non-blocking — errors are logged but do not affect the main flow.
+   *
+   * Requirements: 1.2
+   */
+  private async associateImagesWithCache(
+    designerExecutionId: string,
+    contentExecutionId: string,
+    tenantId: string,
+  ): Promise<void> {
+    try {
+      // Query the latest images for this designer execution
+      const images = await this.imageRepository.find({
+        where: { executionId: designerExecutionId, isLatest: true },
+      });
+
+      if (images.length === 0) {
+        this.logger.debug(
+          `No images found for designer execution=${designerExecutionId}, skipping cache association`,
+        );
+        return;
+      }
+
+      // Map to the format expected by PromptCacheService.associateImages()
+      const imageReferences = images.map((image) => ({
+        imageId: image.id,
+        url: image.urlPresigned || '',
+        redeSocial: image.redeSocial,
+      }));
+
+      await this.promptCacheService.associateImages(contentExecutionId, tenantId, imageReferences);
+
+      this.logger.log(
+        `Associated ${imageReferences.length} images with cache entry for contentExecution=${contentExecutionId}`,
+      );
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      this.logger.warn(
+        `Failed to associate images with cache for contentExecution=${contentExecutionId}: ${err.message}`,
+        err.stack,
+      );
+    }
   }
 
   /**
@@ -456,12 +504,10 @@ export class DesignerAgentService {
         }
       }
 
-      const sugestoesVisuais = parsedOutput.sugestoes_visuais
-        || parsedOutput.sugestoesVisuais
-        || {};
-      const redesSociais = parsedOutput.redes_sociais
-        || parsedOutput.redesSociais
-        || Object.keys(sugestoesVisuais);
+      const sugestoesVisuais =
+        parsedOutput.sugestoes_visuais || parsedOutput.sugestoesVisuais || {};
+      const redesSociais =
+        parsedOutput.redes_sociais || parsedOutput.redesSociais || Object.keys(sugestoesVisuais);
 
       return {
         status,
@@ -470,9 +516,7 @@ export class DesignerAgentService {
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      this.logger.warn(
-        `Failed to load content execution ${contentExecutionId}: ${message}`,
-      );
+      this.logger.warn(`Failed to load content execution ${contentExecutionId}: ${message}`);
       return null;
     }
   }
@@ -485,13 +529,8 @@ export class DesignerAgentService {
    *
    * Requirements: 4.5, 8.1, 8.3, 8.4
    */
-  async getExecution(
-    executionId: string,
-    tenantId: string,
-  ): Promise<DesignerAgentResponse> {
-    this.logger.log(
-      `Getting execution=${executionId}, tenant=${tenantId}`,
-    );
+  async getExecution(executionId: string, tenantId: string): Promise<DesignerAgentResponse> {
+    this.logger.log(`Getting execution=${executionId}, tenant=${tenantId}`);
 
     // Query execution (RLS filters by tenant automatically)
     const execution = await this.executionRepository.findOne({
@@ -499,9 +538,7 @@ export class DesignerAgentService {
     });
 
     if (!execution) {
-      throw new NotFoundException(
-        `Execução ${executionId} não encontrada`,
-      );
+      throw new NotFoundException(`Execução ${executionId} não encontrada`);
     }
 
     // Query latest images for this execution
@@ -548,11 +585,7 @@ export class DesignerAgentService {
    *
    * Requirements: 4.5, 8.3
    */
-  async getDownloadUrl(
-    executionId: string,
-    imageId: string,
-    tenantId: string,
-  ): Promise<string> {
+  async getDownloadUrl(executionId: string, imageId: string, tenantId: string): Promise<string> {
     this.logger.log(
       `Getting download URL for execution=${executionId}, image=${imageId}, tenant=${tenantId}`,
     );
@@ -563,9 +596,7 @@ export class DesignerAgentService {
     });
 
     if (!image) {
-      throw new NotFoundException(
-        `Imagem ${imageId} não encontrada na execução ${executionId}`,
-      );
+      throw new NotFoundException(`Imagem ${imageId} não encontrada na execução ${executionId}`);
     }
 
     // Check if URL needs regeneration
@@ -584,7 +615,7 @@ export class DesignerAgentService {
       return newUrl;
     }
 
-    return image.urlPresigned || await this.generatePresignedUrl(image.minioPath);
+    return image.urlPresigned || (await this.generatePresignedUrl(image.minioPath));
   }
 
   /**
@@ -619,9 +650,7 @@ export class DesignerAgentService {
    * Updates the database with new URLs and expiration timestamps.
    * Returns the updated image records.
    */
-  private async refreshPresignedUrlsIfNeeded(
-    images: DesignerImage[],
-  ): Promise<DesignerImage[]> {
+  private async refreshPresignedUrlsIfNeeded(images: DesignerImage[]): Promise<DesignerImage[]> {
     const refreshedImages: DesignerImage[] = [];
 
     for (const image of images) {

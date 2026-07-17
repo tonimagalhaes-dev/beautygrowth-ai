@@ -43,17 +43,27 @@ logger = logging.getLogger(__name__)
 async def _gemini_embed(text: str) -> list[float]:
     """Simple embedding function using Gemini's text-embedding model.
 
+    Uses the google-genai SDK v2+ for embedding generation.
     Falls back to a zero vector if embedding fails (e.g., no Qdrant collection),
     allowing the workflow to proceed without Knowledge Hub context.
     """
-    import google.generativeai as genai
+    import asyncio
+
+    from google import genai
 
     try:
-        result = genai.embed_content(
-            model="models/text-embedding-004",
-            content=text,
+        api_key = os.environ.get("GOOGLE_API_KEY")
+        if not api_key:
+            logger.warning("GOOGLE_API_KEY not set, returning zero vector for embedding")
+            return [0.0] * 768
+
+        client = genai.Client(api_key=api_key)
+        result = await asyncio.to_thread(
+            client.models.embed_content,
+            model="text-embedding-004",
+            contents=text,
         )
-        return result["embedding"]
+        return result.embeddings[0].values
     except Exception as exc:
         logger.warning("Embedding failed (will return empty chunks): %s", str(exc))
         # Return a 768-dimensional zero vector as fallback
